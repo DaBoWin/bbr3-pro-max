@@ -23,3 +23,11 @@
 
 ```bash
 wget -qO bbr3.sh https://raw.githubusercontent.com/DaBoWin/bbr3-pro-max/main/main.sh && chmod +x bbr3.sh && ./bbr3.sh
+```
+
+重启之后，如果你想确认 BBR3 是否真的跑起来了，可以输入：
+
+```bash
+modinfo tcp_bbr | grep version
+```
+如果输出 version: 3，那么恭喜你，你的 BBR3-Pro-Max 已经正式起飞了！🚀
