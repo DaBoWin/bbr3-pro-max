@@ -22,4 +22,4 @@
 在终端输入以下命令（需要 **root** 权限）：
 
 ```bash
-wget -qO bbr3.sh [https://raw.githubusercontent.com/DaBoWin/bbr3-pro-max/main/main.sh](https://raw.githubusercontent.com/DaBoWin/bbr3-pro-max/main/main.sh) && chmod +x bbr3.sh && ./bbr3.sh
+wget -qO bbr3.sh https://raw.githubusercontent.com/DaBoWin/bbr3-pro-max/main/main.sh && chmod +x bbr3.sh && ./bbr3.sh
