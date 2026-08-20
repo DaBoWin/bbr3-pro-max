@@ -277,7 +277,7 @@ download_mihomo() {
                 echo "${assets}" |
                 grep -E "^mihomo-linux-arm64-v8-${MIHOMO_VERSION}\.gz$" |
                 head -n1 || true
-            )
+            )"
 
             if [[ -z "${asset}" ]]; then
                 asset="$(
