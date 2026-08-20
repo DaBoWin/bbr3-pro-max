@@ -28,6 +28,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 APP_NAME="mihomo"
+SCRIPT_VERSION="1.1.0"
 
 BIN="/usr/local/bin/mihomo"
 CONF_DIR="/etc/mihomo"
@@ -1023,6 +1024,16 @@ make_vless_uri() {
     echo "vless://${uuid}@${address}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}"
 }
 
+make_tuic_uri() {
+    local address="$1"
+    echo "tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${address}:${TUIC_PORT}?alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&sni=${SNI}#mihomo-tuic"
+}
+
+make_snell_line() {
+    local address="$1"
+    echo "mihomo-snell = snell, ${address}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=5, obfs=http, obfs-host=${SNI}"
+}
+
 # ============================================================
 # 生成客户端配置
 # ============================================================
@@ -1128,11 +1139,11 @@ proxies:
 EOF
 
     cat > "${CLIENT_DIR}/tuic-uri.txt" <<EOF
-tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${PUBLIC_IPV4}:${TUIC_PORT}?alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&sni=${SNI}#mihomo-tuic
+$(make_tuic_uri "${PUBLIC_IPV4}")
 EOF
 
     cat > "${CLIENT_DIR}/snell-surge.conf" <<EOF
-mihomo-snell = snell, ${PUBLIC_IPV4}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=5, obfs=http, obfs-host=${SNI}
+$(make_snell_line "${PUBLIC_IPV4}")
 EOF
 
     # --------------------------------------------------------
@@ -1183,6 +1194,7 @@ EOF
     cat > "${INFO_FILE}" <<EOF
 ============================================================
 mihomo VLESS Reality Server
+安装脚本版本：${SCRIPT_VERSION}
 ============================================================
 
 mihomo:
@@ -1234,6 +1246,37 @@ ${DEFAULT_UUID}
 VLESS URI:
 
 $(make_vless_uri "${DEFAULT_UUID}" "${DEFAULT_USERNAME}" "${PUBLIC_IPV4}")
+
+============================================================
+TUIC (UDP ${TUIC_PORT})
+============================================================
+
+UUID:
+${TUIC_UUID}
+
+Password:
+${TUIC_PASSWORD}
+
+SNI:
+${SNI}
+
+TUIC URI:
+
+$(make_tuic_uri "${PUBLIC_IPV4}")
+
+============================================================
+Snell v5 (TCP ${SNELL_PORT})
+============================================================
+
+PSK:
+${SNELL_PSK}
+
+obfs:
+http (obfs-host=${SNI})
+
+Surge:
+
+$(make_snell_line "${PUBLIC_IPV4}")
 
 ============================================================
 CLIENT FILES
@@ -1288,6 +1331,7 @@ install_all() {
     echo
     echo "============================================================"
     echo "          mihomo VLESS Reality 一键安装器"
+    echo "                 版本 ${SCRIPT_VERSION}"
     echo "============================================================"
     echo
 
@@ -1309,6 +1353,10 @@ install_all() {
     log "停止可能正在运行的旧服务（如果存在）..."
     systemctl stop mihomo 2>/dev/null || true
     systemctl stop snell 2>/dev/null || true
+    # 兜底：清理不受 systemd 管理的残留进程（否则孤儿进程会继续占用端口）。
+    pkill -x mihomo 2>/dev/null || true
+    pkill -x snell-server 2>/dev/null || true
+    sleep 1
 
     select_port
     select_aux_port TUIC_PORT "TUIC"
@@ -1344,32 +1392,35 @@ install_all() {
     echo "                 安装完成"
     echo "============================================================"
     echo
+    echo "脚本版本：${SCRIPT_VERSION}"
     echo "mihomo：${MIHOMO_VERSION}"
     echo
     echo "服务器 IPv4：${PUBLIC_IPV4}"
     echo "服务器 IPv6：${PUBLIC_IPV6:-未检测到}"
-    echo "端口：${PORT}"
     echo
     echo "SNI：${SNI}"
     echo "DEST：${DEST}"
     echo
-    echo "Reality Public Key："
-    echo "${PUBLIC_KEY}"
-    echo
-    echo "Reality Short ID："
-    echo "${SHORT_ID}"
-    echo
-    echo "UUID："
-    echo "${DEFAULT_UUID}"
-    echo
     echo "------------------------------------------------------------"
-    echo "VLESS URI"
+    echo "VLESS Reality  (TCP ${PORT})"
     echo "------------------------------------------------------------"
     echo
     make_vless_uri \
         "${DEFAULT_UUID}" \
         "${DEFAULT_USERNAME}" \
         "${PUBLIC_IPV4}"
+    echo
+    echo "------------------------------------------------------------"
+    echo "TUIC  (UDP ${TUIC_PORT})"
+    echo "------------------------------------------------------------"
+    echo
+    make_tuic_uri "${PUBLIC_IPV4}"
+    echo
+    echo "------------------------------------------------------------"
+    echo "Snell v5  (TCP ${SNELL_PORT})"
+    echo "------------------------------------------------------------"
+    echo
+    make_snell_line "${PUBLIC_IPV4}"
     echo
     echo "------------------------------------------------------------"
     echo "客户端配置"
@@ -1425,7 +1476,7 @@ show_status() {
 
     echo
     echo "============================================================"
-    echo "mihomo status"
+    echo "mihomo status    (脚本版本 ${SCRIPT_VERSION})"
     echo "============================================================"
     echo
 
@@ -1448,9 +1499,16 @@ show_status() {
     echo "============================================================"
     echo
 
-    ss -lntp 2>/dev/null |
-        grep ":${PORT}" ||
-        true
+    echo "VLESS  (TCP ${PORT}):"
+    ss -lntpH 2>/dev/null | grep -E ":${PORT}[[:space:]]" || echo "  [!] 未监听"
+    echo
+
+    echo "TUIC   (UDP ${TUIC_PORT}):"
+    ss -lunpH 2>/dev/null | grep -E ":${TUIC_PORT}[[:space:]]" || echo "  [!] 未监听"
+    echo
+
+    echo "Snell  (TCP ${SNELL_PORT}):"
+    ss -lntpH 2>/dev/null | grep -E ":${SNELL_PORT}[[:space:]]" || echo "  [!] 未监听"
 
     echo
 
