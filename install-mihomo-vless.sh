@@ -2,24 +2,21 @@
 set -Eeuo pipefail
 
 # ============================================================
-# mihomo VLESS + Reality 一键服务端
+# mihomo VLESS Reality 一键服务端
 #
 # 支持：
 #   install
 #   status
 #   restart
-#   uninstall
-#   add-user
-#   del-user
+#   add-user <username>
+#   del-user <username>
 #   list-user
+#   uninstall
 #
 # 默认：
-#   Port: 443
-#   SNI:  www.apple.com
-#   DEST: www.apple.com:443
-#
-# 安装：
-#   bash install-mihomo-vless.sh
+#   Port = 443
+#   SNI  = www.apple.com
+#   DEST = www.apple.com:443
 #
 # 自定义：
 #   SNI=www.microsoft.com \
@@ -30,33 +27,35 @@ set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-APP="mihomo"
+APP_NAME="mihomo"
+
 BIN="/usr/local/bin/mihomo"
 CONF_DIR="/etc/mihomo"
-CONF="${CONF_DIR}/config.yaml"
+CONF_FILE="${CONF_DIR}/config.yaml"
 USERS_FILE="${CONF_DIR}/users"
 INFO_FILE="${CONF_DIR}/node-info"
+SERVER_ENV="${CONF_DIR}/server.env"
 CLIENT_DIR="${CONF_DIR}/clients"
-SERVICE="/etc/systemd/system/mihomo.service"
+
+SERVICE_FILE="/etc/systemd/system/mihomo.service"
 
 PORT="${PORT:-443}"
 SNI="${SNI:-www.apple.com}"
 DEST="${DEST:-${SNI}:443}"
 
-TMP_DIR="/tmp/mihomo-install.$$"
+TMP_DIR="$(mktemp -d /tmp/mihomo-install.XXXXXX)"
 
 cleanup() {
     rm -rf "${TMP_DIR}" 2>/dev/null || true
 }
+
 trap cleanup EXIT
 
-die() {
-    echo
-    echo "ERROR: $*" >&2
-    exit 1
-}
+# ============================================================
+# 基础函数
+# ============================================================
 
-info() {
+log() {
     echo "[+] $*"
 }
 
@@ -64,41 +63,76 @@ warn() {
     echo "[!] $*" >&2
 }
 
+error() {
+    echo "[ERROR] $*" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
 require_root() {
-    [[ "${EUID}" -eq 0 ]] || die "请使用 root 运行。"
+    if [[ "${EUID}" -ne 0 ]]; then
+        die "请使用 root 运行。"
+    fi
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
 # ============================================================
-# 基础检测
+# 检查系统
 # ============================================================
 
 check_os() {
 
-    [[ -f /etc/os-release ]] || die "无法检测操作系统。"
+    [[ -f /etc/os-release ]] ||
+        die "无法检测系统。"
 
-    . /etc/os-release
+    # shellcheck disable=SC1091
+    source /etc/os-release
 
     case "${ID}" in
         debian|ubuntu)
             ;;
         *)
-            die "当前系统 ${ID} 不在支持列表中，请使用 Debian/Ubuntu。"
+            die "不支持的系统：${PRETTY_NAME:-${ID}}"
             ;;
     esac
 
-    info "系统：${PRETTY_NAME}"
+    log "系统：${PRETTY_NAME:-${ID}}"
+
+    if command_exists systemd-detect-virt; then
+        VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+
+        if [[ -n "${VIRT}" && "${VIRT}" != "none" ]]; then
+            log "虚拟化环境：${VIRT}"
+        fi
+    fi
 }
+
+# ============================================================
+# 安装系统依赖
+# ============================================================
 
 install_dependencies() {
 
-    info "安装依赖..."
+    log "安装系统依赖..."
 
     apt-get update -y
 
+    # 注意：
+    # Debian 13 中 awk 是虚拟包，不能：
+    #
+    #   apt install awk
+    #
+    # 所以这里只安装真正需要的包。
     apt-get install -y \
+        ca-certificates \
         curl \
         wget \
-        ca-certificates \
         gzip \
         openssl \
         uuid-runtime \
@@ -106,12 +140,37 @@ install_dependencies() {
         procps \
         nftables \
         jq \
-        coreutils \
-        sed \
-        grep \
-        awk \
         socat
 
+    # awk 应该由 Debian 基础系统提供。
+    if ! command_exists awk; then
+        log "系统没有 awk，安装 mawk..."
+        apt-get install -y mawk
+    fi
+
+    local required_commands=(
+        curl
+        wget
+        gzip
+        openssl
+        uuidgen
+        ip
+        ss
+        jq
+        awk
+        sed
+        grep
+    )
+
+    local cmd
+
+    for cmd in "${required_commands[@]}"; do
+        if ! command_exists "${cmd}"; then
+            die "缺少必要命令：${cmd}"
+        fi
+    done
+
+    log "系统依赖检查通过。"
 }
 
 # ============================================================
@@ -125,156 +184,175 @@ detect_arch() {
     case "${ARCH}" in
 
         x86_64|amd64)
-            MIHOMO_ARCH="amd64"
-
-            CPU_FLAGS="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
-
-            if echo "${CPU_FLAGS}" | grep -qw avx2; then
-                MIHOMO_VARIANT="v3"
-            elif echo "${CPU_FLAGS}" | grep -qw avx; then
-                MIHOMO_VARIANT="v2"
-            else
-                MIHOMO_VARIANT="compatible"
-            fi
+            TARGET_ARCH="amd64"
             ;;
 
         aarch64|arm64)
-            MIHOMO_ARCH="arm64"
-            MIHOMO_VARIANT="v8"
+            TARGET_ARCH="arm64"
             ;;
 
         armv7l|armv7)
-            MIHOMO_ARCH="armv7"
-            MIHOMO_VARIANT="compatible"
-            ;;
-
-        armv6l|armv6)
-            MIHOMO_ARCH="armv6"
-            MIHOMO_VARIANT="compatible"
+            TARGET_ARCH="armv7"
             ;;
 
         *)
-            die "不支持的 CPU 架构：${ARCH}"
+            die "暂不支持 CPU 架构：${ARCH}"
             ;;
     esac
 
-    info "CPU：${ARCH}"
+    log "CPU 架构：${ARCH}"
 }
 
 # ============================================================
-# 获取最新稳定版本
+# 获取 mihomo 最新稳定版
 # ============================================================
 
-get_latest_version() {
+get_mihomo_release() {
 
-    info "获取 mihomo 最新稳定版..."
+    log "获取 mihomo 最新稳定版..."
 
-    LATEST_VERSION="$(
+    RELEASE_JSON="$(
         curl -fsSL \
             --retry 3 \
             --connect-timeout 10 \
-            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest |
-        jq -r '.tag_name'
+            --max-time 30 \
+            "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+    )" || die "无法访问 GitHub API。"
+
+    MIHOMO_VERSION="$(
+        echo "${RELEASE_JSON}" |
+        jq -r '.tag_name // empty'
     )"
 
-    [[ -n "${LATEST_VERSION}" ]] || die "无法获取 mihomo 最新版本。"
+    [[ -n "${MIHOMO_VERSION}" ]] ||
+        die "无法获取 mihomo 版本。"
 
-    [[ "${LATEST_VERSION}" != "null" ]] ||
-        die "GitHub API 没有返回稳定版本。"
-
-    info "mihomo：${LATEST_VERSION}"
+    log "mihomo 版本：${MIHOMO_VERSION}"
 }
 
 # ============================================================
-# 下载 mihomo
+# 根据 Release Asset 自动选择下载文件
 # ============================================================
 
 download_mihomo() {
 
-    mkdir -p "${TMP_DIR}"
+    log "查找对应架构的 mihomo 二进制..."
 
-    local FILE=""
-    local URL=""
+    local assets
 
-    case "${MIHOMO_ARCH}" in
+    assets="$(
+        echo "${RELEASE_JSON}" |
+        jq -r '.assets[].name'
+    )"
+
+    [[ -n "${assets}" ]] ||
+        die "Release 中没有找到 Assets。"
+
+    local asset=""
+
+    case "${TARGET_ARCH}" in
 
         amd64)
 
-            if [[ "${MIHOMO_VARIANT}" == "compatible" ]]; then
-                FILE="mihomo-linux-amd64-compatible-${LATEST_VERSION}.gz"
-            else
-                FILE="mihomo-linux-amd64-${MIHOMO_VARIANT}-${LATEST_VERSION}.gz"
+            # 优先使用 compatible，兼容范围最大。
+            asset="$(
+                echo "${assets}" |
+                grep -E "^mihomo-linux-amd64-compatible-${MIHOMO_VERSION}\.gz$" |
+                head -n1 || true
+            )"
+
+            # 如果没有 compatible，则尝试普通 amd64。
+            if [[ -z "${asset}" ]]; then
+                asset="$(
+                    echo "${assets}" |
+                    grep -E "^mihomo-linux-amd64(-v[0-9]+)?-${MIHOMO_VERSION}\.gz$" |
+                    head -n1 || true
+                )"
             fi
             ;;
 
         arm64)
-            FILE="mihomo-linux-arm64-v8-${LATEST_VERSION}.gz"
+
+            asset="$(
+                echo "${assets}" |
+                grep -E "^mihomo-linux-arm64-v8-${MIHOMO_VERSION}\.gz$" |
+                head -n1 || true
+            )
+
+            if [[ -z "${asset}" ]]; then
+                asset="$(
+                    echo "${assets}" |
+                    grep -E "^mihomo-linux-arm64-${MIHOMO_VERSION}\.gz$" |
+                    head -n1 || true
+                )"
+            fi
             ;;
 
         armv7)
-            FILE="mihomo-linux-armv7-${LATEST_VERSION}.gz"
+
+            asset="$(
+                echo "${assets}" |
+                grep -E "^mihomo-linux-armv7-${MIHOMO_VERSION}\.gz$" |
+                head -n1 || true
+            )"
             ;;
 
-        armv6)
-            FILE="mihomo-linux-armv6-${LATEST_VERSION}.gz"
-            ;;
-
-        *)
-            die "未知架构。"
-            ;;
     esac
 
-    URL="https://github.com/MetaCubeX/mihomo/releases/download/${LATEST_VERSION}/${FILE}"
+    [[ -n "${asset}" ]] ||
+        die "没有找到 ${TARGET_ARCH} 对应的 mihomo Release 文件。"
 
-    info "下载：${FILE}"
+    log "下载文件：${asset}"
 
-    if ! curl -fL \
+    local download_url
+
+    download_url="$(
+        echo "${RELEASE_JSON}" |
+        jq -r \
+            --arg name "${asset}" \
+            '.assets[] | select(.name == $name) | .browser_download_url'
+    )"
+
+    [[ -n "${download_url}" ]] ||
+        die "无法获取下载地址。"
+
+    curl -fL \
         --retry 3 \
         --connect-timeout 15 \
-        "${URL}" \
-        -o "${TMP_DIR}/mihomo.gz"; then
+        --max-time 180 \
+        "${download_url}" \
+        -o "${TMP_DIR}/mihomo.gz" ||
+        die "下载 mihomo 失败。"
 
-        # amd64 fallback
-        if [[ "${MIHOMO_ARCH}" == "amd64" ]]; then
-
-            FILE="mihomo-linux-amd64-compatible-${LATEST_VERSION}.gz"
-
-            URL="https://github.com/MetaCubeX/mihomo/releases/download/${LATEST_VERSION}/${FILE}"
-
-            warn "优化版本下载失败，尝试 compatible..."
-
-            curl -fL \
-                --retry 3 \
-                --connect-timeout 15 \
-                "${URL}" \
-                -o "${TMP_DIR}/mihomo.gz"
-        else
-            die "下载 mihomo 失败。"
-        fi
-    fi
-
-    gzip -dc "${TMP_DIR}/mihomo.gz" > "${TMP_DIR}/mihomo"
+    gzip -dc \
+        "${TMP_DIR}/mihomo.gz" \
+        > "${TMP_DIR}/mihomo" ||
+        die "解压 mihomo 失败。"
 
     chmod +x "${TMP_DIR}/mihomo"
+
+    # 基础运行测试
+    "${TMP_DIR}/mihomo" -v >/dev/null 2>&1 ||
+        die "下载的 mihomo 无法运行。"
 
     install -m 0755 \
         "${TMP_DIR}/mihomo" \
         "${BIN}"
 
-    info "mihomo 已安装。"
+    log "mihomo 安装完成。"
 
     "${BIN}" -v || true
 }
 
 # ============================================================
-# 创建用户
+# 创建系统用户
 # ============================================================
 
 create_system_user() {
 
     if ! id mihomo >/dev/null 2>&1; then
 
-        info "创建 mihomo 系统用户..."
+        log "创建 mihomo 系统用户..."
 
         useradd \
             --system \
@@ -289,155 +367,105 @@ create_system_user() {
 
     touch "${USERS_FILE}"
 
-    chmod 600 "${USERS_FILE}"
-
     chown -R mihomo:mihomo "${CONF_DIR}"
 
     chmod 755 "${CONF_DIR}"
     chmod 700 "${CLIENT_DIR}"
-}
-
-# ============================================================
-# UUID
-# ============================================================
-
-generate_uuid() {
-
-    uuidgen
-}
-
-# ============================================================
-# Reality Key
-# ============================================================
-
-generate_reality() {
-
-    info "生成 Reality KeyPair..."
-
-    REALITY_OUTPUT="$("${BIN}" generate reality-keypair)"
-
-    PRIVATE_KEY="$(
-        echo "${REALITY_OUTPUT}" |
-        awk -F': ' '/PrivateKey/ {print $2}' |
-        tr -d '[:space:]'
-    )"
-
-    PUBLIC_KEY="$(
-        echo "${REALITY_OUTPUT}" |
-        awk -F': ' '/PublicKey/ {print $2}' |
-        tr -d '[:space:]'
-    )"
-
-    [[ -n "${PRIVATE_KEY}" ]] ||
-        die "Reality PrivateKey 生成失败。"
-
-    [[ -n "${PUBLIC_KEY}" ]] ||
-        die "Reality PublicKey 生成失败。"
-
-    info "Reality KeyPair 生成完成。"
-}
-
-# ============================================================
-# Short ID
-# ============================================================
-
-generate_short_id() {
-
-    SHORT_ID="$(openssl rand -hex 8)"
-
-    info "Short ID：${SHORT_ID}"
+    chmod 600 "${USERS_FILE}"
 }
 
 # ============================================================
 # 公网 IPv4
 # ============================================================
 
-detect_public_ipv4() {
+detect_ipv4() {
 
-    info "检测公网 IPv4..."
+    log "检测公网 IPv4..."
 
     PUBLIC_IPV4=""
 
-    for API in \
-        "https://api.ipify.org" \
-        "https://ipv4.icanhazip.com" \
+    local apis=(
+        "https://api.ipify.org"
+        "https://ipv4.icanhazip.com"
         "https://ifconfig.me/ip"
-    do
+    )
 
-        PUBLIC_IPV4="$(
+    local api
+    local result
+
+    for api in "${apis[@]}"; do
+
+        result="$(
             curl -4fsSL \
                 --connect-timeout 5 \
                 --max-time 10 \
-                "${API}" 2>/dev/null |
+                "${api}" 2>/dev/null |
             tr -d '[:space:]' || true
         )"
 
-        if [[ "${PUBLIC_IPV4}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        if [[ "${result}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            PUBLIC_IPV4="${result}"
             break
         fi
-
-        PUBLIC_IPV4=""
     done
 
     [[ -n "${PUBLIC_IPV4}" ]] ||
         die "无法检测公网 IPv4。"
 
-    info "公网 IPv4：${PUBLIC_IPV4}"
+    log "公网 IPv4：${PUBLIC_IPV4}"
 }
 
 # ============================================================
 # 公网 IPv6
 # ============================================================
 
-detect_public_ipv6() {
+detect_ipv6() {
 
-    info "检测公网 IPv6..."
+    log "检测公网 IPv6..."
 
     PUBLIC_IPV6=""
 
-    for API in \
-        "https://api6.ipify.org" \
+    local apis=(
+        "https://api6.ipify.org"
         "https://ipv6.icanhazip.com"
-    do
+    )
 
-        PUBLIC_IPV6="$(
+    local api
+    local result
+
+    for api in "${apis[@]}"; do
+
+        result="$(
             curl -6fsSL \
                 --connect-timeout 5 \
                 --max-time 10 \
-                "${API}" 2>/dev/null |
+                "${api}" 2>/dev/null |
             tr -d '[:space:]' || true
         )"
 
-        if [[ "${PUBLIC_IPV6}" == *:* ]]; then
+        if [[ "${result}" == *:* ]]; then
+            PUBLIC_IPV6="${result}"
             break
         fi
-
-        PUBLIC_IPV6=""
     done
 
     if [[ -n "${PUBLIC_IPV6}" ]]; then
-        info "公网 IPv6：${PUBLIC_IPV6}"
+        log "公网 IPv6：${PUBLIC_IPV6}"
     else
         warn "未检测到公网 IPv6。"
-        PUBLIC_IPV6=""
     fi
 }
 
 # ============================================================
-# IPv6 内核参数
+# IPv6 / IP Forwarding
 # ============================================================
 
-configure_ipv6() {
+configure_network() {
 
-    info "检查 IPv6..."
-
-    if [[ ! -d /proc/sys/net/ipv6 ]]; then
-        warn "当前内核没有 IPv6 支持。"
-        return
-    fi
+    log "配置 IPv4 / IPv6 网络参数..."
 
     cat > /etc/sysctl.d/99-mihomo-network.conf <<'EOF'
-# mihomo network tuning
+# mihomo network configuration
 
 net.ipv4.ip_forward=1
 
@@ -451,9 +479,9 @@ EOF
     sysctl --system >/dev/null 2>&1 || true
 
     if [[ -n "${PUBLIC_IPV6}" ]]; then
-        info "IPv6 已启用。"
+        log "IPv6 已检测到并保持启用。"
     else
-        info "IPv6 内核支持已保留，但当前 VPS 没有可检测公网 IPv6。"
+        warn "当前 VPS 没有可用公网 IPv6，不会人为伪造 IPv6 配置。"
     fi
 }
 
@@ -463,18 +491,20 @@ EOF
 
 configure_bbr() {
 
-    info "配置 BBR..."
+    log "检测 BBR..."
 
-    KERNEL="$(uname -r)"
-
-    if [[ ! -f /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-        warn "系统不支持 TCP 拥塞控制检测。"
+    if [[ ! -f /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+        warn "当前内核无法检测 TCP 拥塞控制算法。"
         return
     fi
 
-    AVAILABLE="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
+    local available
+    available="$(
+        cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null ||
+        true
+    )"
 
-    if echo "${AVAILABLE}" | grep -qw bbr; then
+    if echo "${available}" | grep -qw bbr; then
 
         cat > /etc/sysctl.d/99-mihomo-bbr.conf <<'EOF'
 net.core.default_qdisc=fq
@@ -483,19 +513,22 @@ EOF
 
         sysctl --system >/dev/null 2>&1 || true
 
-        CURRENT="$(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+        local current
+        current="$(
+            cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null ||
+            true
+        )"
 
-        if [[ "${CURRENT}" == "bbr" ]]; then
-            info "BBR 已启用。"
+        if [[ "${current}" == "bbr" ]]; then
+            log "BBR 已启用。"
         else
-            warn "BBR 模块存在，但当前拥塞控制算法为：${CURRENT}"
+            warn "内核支持 BBR，但当前算法为：${current}"
         fi
 
     else
 
-        warn "当前内核没有 BBR。"
-        warn "不会强制修改内核或安装第三方内核。"
-        warn "请升级到支持 BBR 的现代 Linux 内核后再运行脚本。"
+        warn "当前 Linux 内核没有 BBR。"
+        warn "不会自动替换内核，以避免破坏 VPS。"
 
     fi
 }
@@ -506,25 +539,31 @@ EOF
 
 check_port() {
 
-    if command -v ss >/dev/null 2>&1; then
+    log "检查 TCP 443..."
 
-        EXISTING="$(
-            ss -lntp 2>/dev/null |
-            awk '$4 ~ /:443$/'
-        )"
+    local result
 
-        if [[ -n "${EXISTING}" ]]; then
+    result="$(
+        ss -lntp 2>/dev/null |
+        awk '$4 ~ /:443$/ {print}' ||
+        true
+    )"
 
-            # 如果已经是 mihomo 自己，不报错
-            if echo "${EXISTING}" | grep -q "mihomo"; then
-                info "TCP 443 已由 mihomo 占用。"
-            else
-                echo
-                warn "TCP 443 当前已被其他程序占用："
-                echo "${EXISTING}"
-                echo
-                die "请停止占用 443 的程序后再运行安装。"
-            fi
+    if [[ -n "${result}" ]]; then
+
+        if echo "${result}" | grep -q "mihomo"; then
+
+            log "443 已由 mihomo 使用。"
+
+        else
+
+            echo
+            warn "TCP 443 已被其他程序占用："
+            echo
+            echo "${result}"
+            echo
+
+            die "请先释放 TCP 443。"
         fi
     fi
 }
@@ -535,23 +574,23 @@ check_port() {
 
 configure_firewall() {
 
-    info "配置防火墙..."
+    log "配置防火墙..."
 
     # UFW
-    if command -v ufw >/dev/null 2>&1; then
+    if command_exists ufw; then
 
-        if ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw status 2>/dev/null |
+            grep -q "Status: active"; then
 
             ufw allow 443/tcp >/dev/null || true
             ufw allow 443/udp >/dev/null || true
 
-            info "UFW：已放行 TCP/UDP 443。"
-
+            log "UFW：已放行 TCP/UDP 443。"
         fi
     fi
 
     # firewalld
-    if command -v firewall-cmd >/dev/null 2>&1; then
+    if command_exists firewall-cmd; then
 
         if systemctl is-active --quiet firewalld 2>/dev/null; then
 
@@ -563,108 +602,191 @@ configure_firewall() {
                 --permanent \
                 --add-port=443/udp >/dev/null || true
 
-            firewall-cmd --reload >/dev/null || true
+            firewall-cmd \
+                --reload >/dev/null || true
 
-            info "firewalld：已放行 TCP/UDP 443。"
+            log "firewalld：已放行 TCP/UDP 443。"
         fi
     fi
 
-    # nftables
-    if systemctl is-active --quiet nftables 2>/dev/null; then
-        info "检测到 nftables 正在运行。"
-        warn "云厂商安全组仍需自行放行 TCP 443。"
-    fi
-
-    echo
-    warn "如果 VPS 有云厂商安全组，请确保 TCP 443 已放行。"
+    warn "如果 VPS 使用云厂商安全组，请另外放行 TCP 443。"
 }
 
 # ============================================================
-# 生成 users 文件
+# 生成 UUID
 # ============================================================
 
-create_first_user() {
+generate_uuid() {
+    uuidgen
+}
+
+# ============================================================
+# 生成 Reality Key
+# ============================================================
+
+generate_reality_keypair() {
+
+    log "生成 Reality KeyPair..."
+
+    local output
+
+    output="$("${BIN}" generate reality-keypair)" ||
+        die "Reality KeyPair 生成失败。"
+
+    PRIVATE_KEY="$(
+        echo "${output}" |
+        sed -n 's/^PrivateKey: *//p' |
+        head -n1 |
+        tr -d '[:space:]'
+    )"
+
+    PUBLIC_KEY="$(
+        echo "${output}" |
+        sed -n 's/^PublicKey: *//p' |
+        head -n1 |
+        tr -d '[:space:]'
+    )"
+
+    [[ -n "${PRIVATE_KEY}" ]] ||
+        die "没有获取到 Reality PrivateKey。"
+
+    [[ -n "${PUBLIC_KEY}" ]] ||
+        die "没有获取到 Reality PublicKey。"
+
+    log "Reality KeyPair 生成完成。"
+}
+
+# ============================================================
+# Short ID
+# ============================================================
+
+generate_short_id() {
+
+    SHORT_ID="$(openssl rand -hex 8)"
+
+    log "Reality Short ID：${SHORT_ID}"
+}
+
+# ============================================================
+# 初始化用户
+# ============================================================
+
+initialize_user() {
 
     if [[ -s "${USERS_FILE}" ]]; then
 
         FIRST_LINE="$(head -n1 "${USERS_FILE}")"
 
-        UUID="$(echo "${FIRST_LINE}" | cut -d'|' -f2)"
-        USERNAME="$(echo "${FIRST_LINE}" | cut -d'|' -f1)"
+        DEFAULT_USERNAME="$(echo "${FIRST_LINE}" | cut -d'|' -f1)"
+        DEFAULT_UUID="$(echo "${FIRST_LINE}" | cut -d'|' -f2)"
 
         return
     fi
 
-    UUID="$(generate_uuid)"
-    USERNAME="user1"
+    DEFAULT_USERNAME="user1"
+    DEFAULT_UUID="$(generate_uuid)"
 
-    echo "${USERNAME}|${UUID}" > "${USERS_FILE}"
+    echo "${DEFAULT_USERNAME}|${DEFAULT_UUID}" > "${USERS_FILE}"
 
     chmod 600 "${USERS_FILE}"
 
-    info "UUID：${UUID}"
+    log "初始用户：${DEFAULT_USERNAME}"
 }
 
 # ============================================================
-# 写 mihomo 配置
+# 写入 mihomo 配置
 # ============================================================
 
 write_config() {
 
-    info "生成 mihomo 配置..."
+    log "生成 mihomo 配置..."
 
-    {
-        echo "mixed-port: 7890"
-        echo "mode: direct"
-        echo "log-level: info"
-        echo "ipv6: true"
-        echo
-        echo "listeners:"
-        echo
-        echo "  - name: vless-reality"
-        echo "    type: vless"
-        echo "    listen: 0.0.0.0"
-        echo "    port: ${PORT}"
-        echo
-        echo "    users:"
+    cat > "${CONF_FILE}" <<EOF
+mixed-port: 7890
+mode: direct
+log-level: info
+ipv6: true
 
-        while IFS='|' read -r NAME USER_UUID; do
+listeners:
+  - name: vless-reality
+    type: vless
+    listen: 0.0.0.0
+    port: ${PORT}
 
-            [[ -n "${NAME}" ]] || continue
-            [[ -n "${USER_UUID}" ]] || continue
+    users:
+EOF
 
-            echo "      - username: ${NAME}"
-            echo "        uuid: ${USER_UUID}"
-            echo "        flow: xtls-rprx-vision"
+    while IFS='|' read -r username uuid; do
 
-        done < "${USERS_FILE}"
+        [[ -n "${username}" ]] || continue
+        [[ -n "${uuid}" ]] || continue
 
-        echo
-        echo "    reality-config:"
-        echo "      dest: ${DEST}"
-        echo "      private-key: ${PRIVATE_KEY}"
-        echo "      short-id:"
-        echo "        - ${SHORT_ID}"
-        echo "      server-names:"
-        echo "        - ${SNI}"
+        cat >> "${CONF_FILE}" <<EOF
+      - username: ${username}
+        uuid: ${uuid}
+        flow: xtls-rprx-vision
+EOF
 
-    } > "${CONF}"
+    done < "${USERS_FILE}"
 
-    chown mihomo:mihomo "${CONF}"
-    chmod 600 "${CONF}"
+    cat >> "${CONF_FILE}" <<EOF
+
+    reality-config:
+      dest: ${DEST}
+      private-key: ${PRIVATE_KEY}
+
+      short-id:
+        - ${SHORT_ID}
+
+      server-names:
+        - ${SNI}
+EOF
+
+    chmod 600 "${CONF_FILE}"
+    chown mihomo:mihomo "${CONF_FILE}"
 }
 
 # ============================================================
-# systemd
+# 验证 mihomo 配置
 # ============================================================
 
-create_service() {
+validate_config() {
 
-    info "创建 systemd 服务..."
+    log "验证 mihomo 配置..."
 
-    cat > "${SERVICE}" <<EOF
+    if "${BIN}" \
+        -d "${CONF_DIR}" \
+        -f "${CONF_FILE}" \
+        -t >/dev/null 2>&1; then
+
+        log "mihomo 配置验证通过。"
+
+    else
+
+        echo
+        error "mihomo 配置验证失败。"
+        echo
+
+        "${BIN}" \
+            -d "${CONF_DIR}" \
+            -f "${CONF_FILE}" \
+            -t || true
+
+        exit 1
+    fi
+}
+
+# ============================================================
+# 创建 systemd
+# ============================================================
+
+create_systemd() {
+
+    log "创建 systemd 服务..."
+
+    cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=mihomo Proxy Kernel
+Description=mihomo VLESS Reality Server
 Documentation=https://wiki.metacubex.one/
 After=network-online.target
 Wants=network-online.target
@@ -675,7 +797,7 @@ Type=simple
 User=mihomo
 Group=mihomo
 
-ExecStart=${BIN} -d ${CONF_DIR} -f ${CONF}
+ExecStart=${BIN} -d ${CONF_DIR} -f ${CONF_FILE}
 
 Restart=on-failure
 RestartSec=3
@@ -685,9 +807,8 @@ LimitNOFILE=1048576
 NoNewPrivileges=true
 
 PrivateTmp=true
-
-ProtectSystem=full
 ProtectHome=true
+ProtectSystem=full
 
 ReadWritePaths=${CONF_DIR}
 
@@ -700,12 +821,12 @@ EOF
 }
 
 # ============================================================
-# 启动
+# 启动 mihomo
 # ============================================================
 
-start_service() {
+start_mihomo() {
 
-    info "启动 mihomo..."
+    log "启动 mihomo..."
 
     systemctl restart mihomo
 
@@ -713,9 +834,7 @@ start_service() {
 
     if ! systemctl is-active --quiet mihomo; then
 
-        echo
-        warn "mihomo 启动失败。"
-        echo
+        error "mihomo 启动失败。"
 
         journalctl \
             -u mihomo \
@@ -725,46 +844,52 @@ start_service() {
         exit 1
     fi
 
-    info "mihomo 正常运行。"
+    log "mihomo 正常运行。"
 }
 
 # ============================================================
-# 生成客户端文件
+# 生成 VLESS URI
+# ============================================================
+
+make_vless_uri() {
+
+    local uuid="$1"
+    local username="$2"
+    local address="$3"
+
+    echo "vless://${uuid}@${address}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}"
+}
+
+# ============================================================
+# 生成客户端配置
 # ============================================================
 
 generate_client_configs() {
+
+    log "生成客户端配置..."
 
     mkdir -p "${CLIENT_DIR}"
 
     chmod 700 "${CLIENT_DIR}"
 
-    # 当前第一个用户
-    FIRST_LINE="$(head -n1 "${USERS_FILE}")"
+    local first_line
+    first_line="$(head -n1 "${USERS_FILE}")"
 
-    USERNAME="$(echo "${FIRST_LINE}" | cut -d'|' -f1)"
-    UUID="$(echo "${FIRST_LINE}" | cut -d'|' -f2)"
+    local username
+    local uuid
 
-    # -------------------------
-    # VLESS URI
-    # -------------------------
+    username="$(echo "${first_line}" | cut -d'|' -f1)"
+    uuid="$(echo "${first_line}" | cut -d'|' -f2)"
 
-    VLESS_URI="vless://${UUID}@${PUBLIC_IPV4}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${USERNAME}"
+    local uri
 
-    if [[ -n "${PUBLIC_IPV6}" ]]; then
+    uri="$(make_vless_uri "${uuid}" "${username}" "${PUBLIC_IPV4}")"
 
-        VLESS_URI_IPV6="vless://${UUID}@\[${PUBLIC_IPV6}\]:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${USERNAME}-IPv6"
+    echo "${uri}" > "${CLIENT_DIR}/vless-uri.txt"
 
-    else
-
-        VLESS_URI_IPV6=""
-
-    fi
-
-    echo "${VLESS_URI}" > "${CLIENT_DIR}/vless-uri.txt"
-
-    # -------------------------
+    # --------------------------------------------------------
     # Mihomo / Clash Meta
-    # -------------------------
+    # --------------------------------------------------------
 
     cat > "${CLIENT_DIR}/mihomo.yaml" <<EOF
 proxies:
@@ -772,7 +897,7 @@ proxies:
     type: vless
     server: ${PUBLIC_IPV4}
     port: 443
-    uuid: ${UUID}
+    uuid: ${uuid}
     udp: true
     tls: true
     servername: ${SNI}
@@ -783,9 +908,9 @@ proxies:
       short-id: ${SHORT_ID}
 EOF
 
-    # -------------------------
+    # --------------------------------------------------------
     # sing-box
-    # -------------------------
+    # --------------------------------------------------------
 
     cat > "${CLIENT_DIR}/sing-box.json" <<EOF
 {
@@ -795,7 +920,7 @@ EOF
       "tag": "mihomo-vless-reality",
       "server": "${PUBLIC_IPV4}",
       "server_port": 443,
-      "uuid": "${UUID}",
+      "uuid": "${uuid}",
       "flow": "xtls-rprx-vision",
       "tls": {
         "enabled": true,
@@ -815,23 +940,59 @@ EOF
 }
 EOF
 
-    # -------------------------
+    # --------------------------------------------------------
     # V2RayN
-    # -------------------------
+    # --------------------------------------------------------
 
-    echo "${VLESS_URI}" > "${CLIENT_DIR}/v2rayn-vless.txt"
+    echo "${uri}" > "${CLIENT_DIR}/v2rayn-vless.txt"
 
-    # -------------------------
-    # 节点信息
-    # -------------------------
+    # --------------------------------------------------------
+    # IPv6 URI
+    # --------------------------------------------------------
+
+    if [[ -n "${PUBLIC_IPV6}" ]]; then
+
+        local ipv6_uri
+
+        ipv6_uri="vless://${uuid}@\[${PUBLIC_IPV6}\]:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}-IPv6"
+
+        echo "${ipv6_uri}" > "${CLIENT_DIR}/vless-ipv6-uri.txt"
+
+    fi
+
+    chmod 600 "${CLIENT_DIR}"/*
+
+    chown -R mihomo:mihomo "${CLIENT_DIR}"
+}
+
+# ============================================================
+# 保存服务端信息
+# ============================================================
+
+save_info() {
+
+    cat > "${SERVER_ENV}" <<EOF
+PORT=${PORT}
+SNI=${SNI}
+DEST=${DEST}
+PUBLIC_IPV4=${PUBLIC_IPV4}
+PUBLIC_IPV6=${PUBLIC_IPV6}
+PRIVATE_KEY=${PRIVATE_KEY}
+PUBLIC_KEY=${PUBLIC_KEY}
+SHORT_ID=${SHORT_ID}
+EOF
+
+    chmod 600 "${SERVER_ENV}"
+
+    chown mihomo:mihomo "${SERVER_ENV}"
 
     cat > "${INFO_FILE}" <<EOF
-==================================================
-mihomo VLESS Reality Node
-==================================================
+============================================================
+mihomo VLESS Reality Server
+============================================================
 
-mihomo version:
-${LATEST_VERSION}
+mihomo:
+${MIHOMO_VERSION}
 
 Server IPv4:
 ${PUBLIC_IPV4}
@@ -840,7 +1001,7 @@ Server IPv6:
 ${PUBLIC_IPV6:-N/A}
 
 Port:
-443
+${PORT}
 
 Protocol:
 VLESS
@@ -857,17 +1018,8 @@ ${SNI}
 DEST:
 ${DEST}
 
-UUID:
-${UUID}
-
-Username:
-${USERNAME}
-
 Reality Public Key:
 ${PUBLIC_KEY}
-
-Reality Private Key:
-${PRIVATE_KEY}
 
 Reality Short ID:
 ${SHORT_ID}
@@ -875,66 +1027,53 @@ ${SHORT_ID}
 Flow:
 xtls-rprx-vision
 
-==================================================
-VLESS URI
-==================================================
+============================================================
+FIRST USER
+============================================================
 
-${VLESS_URI}
+Username:
+${DEFAULT_USERNAME}
 
+UUID:
+${DEFAULT_UUID}
+
+VLESS URI:
+
+$(make_vless_uri "${DEFAULT_UUID}" "${DEFAULT_USERNAME}" "${PUBLIC_IPV4}")
+
+============================================================
+CLIENT FILES
+============================================================
+
+Mihomo / Clash:
+${CLIENT_DIR}/mihomo.yaml
+
+sing-box:
+${CLIENT_DIR}/sing-box.json
+
+V2RayN:
+${CLIENT_DIR}/v2rayn-vless.txt
+
+VLESS URI:
+${CLIENT_DIR}/vless-uri.txt
+
+============================================================
 EOF
 
-    if [[ -n "${VLESS_URI_IPV6}" ]]; then
+    if [[ -n "${PUBLIC_IPV6}" ]]; then
 
         cat >> "${INFO_FILE}" <<EOF
 
 IPv6 VLESS URI:
 
-${VLESS_URI_IPV6}
+$(cat "${CLIENT_DIR}/vless-ipv6-uri.txt")
 
 EOF
 
     fi
 
-    cat >> "${INFO_FILE}" <<EOF
-
-Client files:
-
-${CLIENT_DIR}/mihomo.yaml
-${CLIENT_DIR}/sing-box.json
-${CLIENT_DIR}/v2rayn-vless.txt
-
-==================================================
-EOF
-
-    chown -R mihomo:mihomo "${CLIENT_DIR}" "${INFO_FILE}"
-
-    chmod 600 \
-        "${CLIENT_DIR}"/* \
-        "${INFO_FILE}"
-}
-
-# ============================================================
-# 保存安装信息
-# ============================================================
-
-save_node_info() {
-
-    mkdir -p "${CONF_DIR}"
-
-    cat > "${CONF_DIR}/server.env" <<EOF
-PORT=${PORT}
-SNI=${SNI}
-DEST=${DEST}
-PUBLIC_IPV4=${PUBLIC_IPV4}
-PUBLIC_IPV6=${PUBLIC_IPV6}
-PRIVATE_KEY=${PRIVATE_KEY}
-PUBLIC_KEY=${PUBLIC_KEY}
-SHORT_ID=${SHORT_ID}
-EOF
-
-    chmod 600 "${CONF_DIR}/server.env"
-
-    chown mihomo:mihomo "${CONF_DIR}/server.env"
+    chmod 600 "${INFO_FILE}"
+    chown mihomo:mihomo "${INFO_FILE}"
 }
 
 # ============================================================
@@ -946,59 +1085,57 @@ install_all() {
     require_root
 
     echo
-    echo "=================================================="
-    echo "       mihomo VLESS Reality 一键安装器"
-    echo "=================================================="
+    echo "============================================================"
+    echo "          mihomo VLESS Reality 一键安装器"
+    echo "============================================================"
     echo
 
     check_os
-
     install_dependencies
-
     detect_arch
-
-    get_latest_version
-
-    detect_public_ipv4
-
-    detect_public_ipv6
-
-    check_port
-
+    get_mihomo_release
     download_mihomo
+
+    mkdir -p "${CONF_DIR}" "${CLIENT_DIR}"
 
     create_system_user
 
-    create_first_user
+    detect_ipv4
+    detect_ipv6
 
-    generate_reality
+    check_port
 
+    generate_reality_keypair
     generate_short_id
 
-    configure_ipv6
+    initialize_user
 
+    configure_network
     configure_bbr
 
     write_config
+    validate_config
 
-    create_service
+    create_systemd
 
     configure_firewall
 
-    save_node_info
-
-    start_service
-
+    save_info
     generate_client_configs
 
+    start_mihomo
+
     echo
-    echo "=================================================="
-    echo "             安装完成"
-    echo "=================================================="
+    echo "============================================================"
+    echo "                 安装完成"
+    echo "============================================================"
+    echo
+    echo "mihomo：${MIHOMO_VERSION}"
     echo
     echo "服务器 IPv4：${PUBLIC_IPV4}"
     echo "服务器 IPv6：${PUBLIC_IPV6:-未检测到}"
     echo "端口：443"
+    echo
     echo "SNI：${SNI}"
     echo "DEST：${DEST}"
     echo
@@ -1009,17 +1146,22 @@ install_all() {
     echo "${SHORT_ID}"
     echo
     echo "UUID："
-    echo "${UUID}"
+    echo "${DEFAULT_UUID}"
     echo
-    echo "--------------------------------------------------"
-    echo "VLESS URI："
+    echo "------------------------------------------------------------"
+    echo "VLESS URI"
+    echo "------------------------------------------------------------"
     echo
-    echo "${VLESS_URI}"
+    make_vless_uri \
+        "${DEFAULT_UUID}" \
+        "${DEFAULT_USERNAME}" \
+        "${PUBLIC_IPV4}"
     echo
-    echo "--------------------------------------------------"
-    echo "客户端配置："
+    echo "------------------------------------------------------------"
+    echo "客户端配置"
+    echo "------------------------------------------------------------"
     echo
-    echo "mihomo / Clash："
+    echo "Mihomo / Clash："
     echo "${CLIENT_DIR}/mihomo.yaml"
     echo
     echo "sing-box："
@@ -1028,23 +1170,24 @@ install_all() {
     echo "V2RayN："
     echo "${CLIENT_DIR}/v2rayn-vless.txt"
     echo
-    echo "完整信息："
+    echo "完整节点信息："
     echo "${INFO_FILE}"
     echo
-    echo "--------------------------------------------------"
-    echo "管理命令："
+    echo "------------------------------------------------------------"
+    echo "管理命令"
+    echo "------------------------------------------------------------"
     echo
-    echo "查看状态："
+    echo "状态："
     echo "  $0 status"
     echo
     echo "重启："
     echo "  $0 restart"
     echo
     echo "添加用户："
-    echo "  $0 add-user 用户名"
+    echo "  $0 add-user alice"
     echo
     echo "删除用户："
-    echo "  $0 del-user 用户名"
+    echo "  $0 del-user alice"
     echo
     echo "用户列表："
     echo "  $0 list-user"
@@ -1052,27 +1195,33 @@ install_all() {
     echo "卸载："
     echo "  $0 uninstall"
     echo
-    echo "查看日志："
+    echo "日志："
     echo "  journalctl -u mihomo -f"
     echo
-    echo "=================================================="
+    echo "============================================================"
 }
 
 # ============================================================
-# 状态
+# status
 # ============================================================
 
-status() {
+show_status() {
 
     require_root
 
     echo
-    echo "========== mihomo status =========="
+    echo "============================================================"
+    echo "mihomo status"
+    echo "============================================================"
     echo
 
-    if systemctl list-unit-files | grep -q '^mihomo.service'; then
+    if systemctl list-unit-files 2>/dev/null |
+        grep -q "^mihomo.service"; then
 
-        systemctl --no-pager --full status mihomo || true
+        systemctl \
+            --no-pager \
+            --full \
+            status mihomo || true
 
     else
 
@@ -1080,16 +1229,24 @@ status() {
     fi
 
     echo
-    echo "========== listeners =========="
+    echo "============================================================"
+    echo "监听端口"
+    echo "============================================================"
     echo
 
-    ss -lntp 2>/dev/null | grep ':443' || true
+    ss -lntp 2>/dev/null |
+        grep ':443' ||
+        true
 
     echo
 
     if [[ -f "${INFO_FILE}" ]]; then
-        echo "========== node info =========="
+
+        echo "============================================================"
+        echo "节点信息"
+        echo "============================================================"
         echo
+
         cat "${INFO_FILE}"
     fi
 }
@@ -1104,13 +1261,13 @@ restart_service() {
 
     systemctl restart mihomo
 
-    sleep 1
+    sleep 2
 
     if systemctl is-active --quiet mihomo; then
-        echo "mihomo 已重启。"
+        echo "mihomo 重启成功。"
     else
         echo "mihomo 重启失败。"
-        journalctl -u mihomo --no-pager -n 50
+        journalctl -u mihomo --no-pager -n 80
         exit 1
     fi
 }
@@ -1123,30 +1280,32 @@ add_user() {
 
     require_root
 
-    local NAME="${1:-}"
+    local username="${1:-}"
 
-    [[ -n "${NAME}" ]] ||
-        die "用法：$0 add-user 用户名"
+    [[ -n "${username}" ]] ||
+        die "用法：$0 add-user <username>"
 
-    [[ "${NAME}" =~ ^[a-zA-Z0-9._-]+$ ]] ||
-        die "用户名只能包含字母、数字、点、下划线和短横线。"
-
-    if grep -q "^${NAME}|" "${USERS_FILE}" 2>/dev/null; then
-        die "用户 ${NAME} 已存在。"
+    if ! [[ "${username}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        die "用户名只能包含：字母、数字、.、_、-"
     fi
 
-    local NEW_UUID
-    NEW_UUID="$(generate_uuid)"
+    if grep -q "^${username}|" "${USERS_FILE}" 2>/dev/null; then
+        die "用户 ${username} 已存在。"
+    fi
 
-    echo "${NAME}|${NEW_UUID}" >> "${USERS_FILE}"
+    local uuid
+    uuid="$(generate_uuid)"
+
+    echo "${username}|${uuid}" >> "${USERS_FILE}"
 
     chmod 600 "${USERS_FILE}"
 
     write_config
+    validate_config
 
     systemctl restart mihomo
 
-    sleep 1
+    sleep 2
 
     if ! systemctl is-active --quiet mihomo; then
 
@@ -1155,34 +1314,22 @@ add_user() {
         journalctl \
             -u mihomo \
             --no-pager \
-            -n 50
+            -n 80
 
         exit 1
     fi
 
-    # 生成该用户 URI
-    local URI
+    local uri
 
-    URI="vless://${NEW_UUID}@${PUBLIC_IPV4}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${NAME}"
+    uri="$(make_vless_uri "${uuid}" "${username}" "${PUBLIC_IPV4}")"
 
-    echo
-    echo "用户添加成功：${NAME}"
-    echo
-    echo "UUID：${NEW_UUID}"
-    echo
-    echo "VLESS URI："
-    echo
-    echo "${URI}"
-    echo
-
-    # 生成独立文件
-    cat > "${CLIENT_DIR}/${NAME}.yaml" <<EOF
+    cat > "${CLIENT_DIR}/${username}.yaml" <<EOF
 proxies:
-  - name: mihomo-${NAME}
+  - name: mihomo-${username}
     type: vless
     server: ${PUBLIC_IPV4}
     port: 443
-    uuid: ${NEW_UUID}
+    uuid: ${uuid}
     udp: true
     tls: true
     servername: ${SNI}
@@ -1193,15 +1340,15 @@ proxies:
       short-id: ${SHORT_ID}
 EOF
 
-    cat > "${CLIENT_DIR}/${NAME}-sing-box.json" <<EOF
+    cat > "${CLIENT_DIR}/${username}-sing-box.json" <<EOF
 {
   "outbounds": [
     {
       "type": "vless",
-      "tag": "mihomo-${NAME}",
+      "tag": "mihomo-${username}",
       "server": "${PUBLIC_IPV4}",
       "server_port": 443,
-      "uuid": "${NEW_UUID}",
+      "uuid": "${uuid}",
       "flow": "xtls-rprx-vision",
       "tls": {
         "enabled": true,
@@ -1221,58 +1368,78 @@ EOF
 }
 EOF
 
-    echo "${URI}" > "${CLIENT_DIR}/${NAME}-v2rayn.txt"
+    echo "${uri}" \
+        > "${CLIENT_DIR}/${username}-v2rayn.txt"
 
-    chown -R mihomo:mihomo "${CLIENT_DIR}"
     chmod 600 "${CLIENT_DIR}"/*
 
-    info "客户端配置已生成。"
+    chown -R mihomo:mihomo "${CLIENT_DIR}"
+
+    echo
+    echo "============================================================"
+    echo "用户添加成功"
+    echo "============================================================"
+    echo
+    echo "用户名：${username}"
+    echo "UUID：${uuid}"
+    echo
+    echo "VLESS URI："
+    echo
+    echo "${uri}"
+    echo
 }
 
 # ============================================================
 # 删除用户
 # ============================================================
 
-del_user() {
+delete_user() {
 
     require_root
 
-    local NAME="${1:-}"
+    local username="${1:-}"
 
-    [[ -n "${NAME}" ]] ||
-        die "用法：$0 del-user 用户名"
+    [[ -n "${username}" ]] ||
+        die "用法：$0 del-user <username>"
 
-    grep -q "^${NAME}|" "${USERS_FILE}" ||
-        die "用户 ${NAME} 不存在。"
+    grep -q "^${username}|" "${USERS_FILE}" ||
+        die "用户 ${username} 不存在。"
 
-    local COUNT
+    local count
 
-    COUNT="$(grep -c '|' "${USERS_FILE}")"
+    count="$(grep -c '|' "${USERS_FILE}" || true)"
 
-    if [[ "${COUNT}" -le 1 ]]; then
+    if [[ "${count}" -le 1 ]]; then
         die "不能删除最后一个用户。"
     fi
 
     cp "${USERS_FILE}" "${USERS_FILE}.bak"
 
-    grep -v "^${NAME}|" \
+    grep -v "^${username}|" \
         "${USERS_FILE}.bak" \
         > "${USERS_FILE}"
 
     rm -f \
-        "${CLIENT_DIR}/${NAME}.yaml" \
-        "${CLIENT_DIR}/${NAME}-sing-box.json" \
-        "${CLIENT_DIR}/${NAME}-v2rayn.txt"
+        "${CLIENT_DIR}/${username}.yaml" \
+        "${CLIENT_DIR}/${username}-sing-box.json" \
+        "${CLIENT_DIR}/${username}-v2rayn.txt"
 
     write_config
 
+    if ! validate_config; then
+
+        cp "${USERS_FILE}.bak" "${USERS_FILE}"
+
+        write_config
+
+        die "删除用户失败，已恢复原配置。"
+    fi
+
     systemctl restart mihomo
 
-    sleep 1
+    sleep 2
 
     if ! systemctl is-active --quiet mihomo; then
-
-        warn "删除用户后 mihomo 启动失败，恢复旧配置。"
 
         cp "${USERS_FILE}.bak" "${USERS_FILE}"
 
@@ -1280,10 +1447,12 @@ del_user() {
 
         systemctl restart mihomo
 
-        exit 1
+        die "删除用户后 mihomo 启动失败，已恢复。"
     fi
 
-    echo "用户 ${NAME} 已删除。"
+    rm -f "${USERS_FILE}.bak"
+
+    echo "用户 ${username} 已删除。"
 }
 
 # ============================================================
@@ -1295,9 +1464,9 @@ list_users() {
     require_root
 
     echo
-    echo "=============================="
-    echo "        mihomo users"
-    echo "=============================="
+    echo "============================================================"
+    echo "mihomo users"
+    echo "============================================================"
     echo
 
     if [[ ! -s "${USERS_FILE}" ]]; then
@@ -1305,16 +1474,16 @@ list_users() {
         return
     fi
 
-    printf "%-20s %s\n" "USERNAME" "UUID"
-    printf "%-20s %s\n" "--------" "----"
+    printf "%-24s %s\n" "USERNAME" "UUID"
+    printf "%-24s %s\n" "--------" "----"
 
-    while IFS='|' read -r NAME UUID; do
+    while IFS='|' read -r username uuid; do
 
-        [[ -n "${NAME}" ]] || continue
+        [[ -n "${username}" ]] || continue
 
-        printf "%-20s %s\n" \
-            "${NAME}" \
-            "${UUID}"
+        printf "%-24s %s\n" \
+            "${username}" \
+            "${uuid}"
 
     done < "${USERS_FILE}"
 
@@ -1322,28 +1491,35 @@ list_users() {
 }
 
 # ============================================================
-# uninstall
+# 卸载
 # ============================================================
 
-uninstall() {
+uninstall_all() {
 
     require_root
 
     echo
-    echo "这将删除："
+    echo "============================================================"
+    echo "卸载 mihomo"
+    echo "============================================================"
     echo
-    echo "  mihomo"
+    echo "将删除："
+    echo
+    echo "  ${BIN}"
     echo "  ${CONF_DIR}"
-    echo "  systemd service"
+    echo "  ${SERVICE_FILE}"
     echo
-    read -r -p "确认卸载？输入 YES： " ANSWER
+    echo "并删除本脚本创建的 BBR / 网络 sysctl 文件。"
+    echo
 
-    [[ "${ANSWER}" == "YES" ]] ||
+    read -r -p "确认卸载？输入 YES： " answer
+
+    [[ "${answer}" == "YES" ]] ||
         die "已取消。"
 
     systemctl disable --now mihomo 2>/dev/null || true
 
-    rm -f "${SERVICE}"
+    rm -f "${SERVICE_FILE}"
     rm -f "${BIN}"
 
     systemctl daemon-reload
@@ -1358,57 +1534,62 @@ uninstall() {
     echo
     echo "mihomo 已卸载。"
     echo
-    echo "注意：没有删除 UFW/firewalld 中原有的 443 规则。"
+    echo "注意：没有自动删除防火墙规则。"
 }
 
 # ============================================================
-# main
+# Main
 # ============================================================
 
-COMMAND="${1:-install}"
+main() {
 
-case "${COMMAND}" in
+    local command="${1:-install}"
 
-    install)
-        install_all
-        ;;
+    case "${command}" in
 
-    status)
-        status
-        ;;
+        install)
+            install_all
+            ;;
 
-    restart)
-        restart_service
-        ;;
+        status)
+            show_status
+            ;;
 
-    add-user)
-        add_user "${2:-}"
-        ;;
+        restart)
+            restart_service
+            ;;
 
-    del-user)
-        del_user "${2:-}"
-        ;;
+        add-user)
+            add_user "${2:-}"
+            ;;
 
-    list-user|list-users)
-        list_users
-        ;;
+        del-user)
+            delete_user "${2:-}"
+            ;;
 
-    uninstall)
-        uninstall
-        ;;
+        list-user|list-users)
+            list_users
+            ;;
 
-    *)
-        echo
-        echo "用法："
-        echo
-        echo "  $0 install"
-        echo "  $0 status"
-        echo "  $0 restart"
-        echo "  $0 add-user 用户名"
-        echo "  $0 del-user 用户名"
-        echo "  $0 list-user"
-        echo "  $0 uninstall"
-        echo
-        exit 1
-        ;;
-esac
+        uninstall)
+            uninstall_all
+            ;;
+
+        *)
+            echo
+            echo "用法："
+            echo
+            echo "  $0 install"
+            echo "  $0 status"
+            echo "  $0 restart"
+            echo "  $0 add-user <username>"
+            echo "  $0 del-user <username>"
+            echo "  $0 list-user"
+            echo "  $0 uninstall"
+            echo
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
