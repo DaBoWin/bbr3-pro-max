@@ -895,8 +895,7 @@ EOF
     listen: 0.0.0.0
     port: ${TUIC_PORT}
     users:
-      - uuid: ${TUIC_UUID}
-        password: ${TUIC_PASSWORD}
+      ${TUIC_UUID}: ${TUIC_PASSWORD}
     certificate: ${TUIC_CERT}
     private-key: ${TUIC_KEY}
     congestion-controller: bbr
@@ -1304,6 +1303,12 @@ install_all() {
 
     detect_ipv4
     detect_ipv6
+
+    # 重装场景：先停止已有服务，释放它们占用的端口，
+    # 否则从 server.env 载入的旧 PORT 会被正在运行的旧实例占用，导致 check_port 失败。
+    log "停止可能正在运行的旧服务（如果存在）..."
+    systemctl stop mihomo 2>/dev/null || true
+    systemctl stop snell 2>/dev/null || true
 
     select_port
     select_aux_port TUIC_PORT "TUIC"
