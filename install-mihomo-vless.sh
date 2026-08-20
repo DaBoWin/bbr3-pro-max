@@ -545,7 +545,8 @@ EOF
 # ============================================================
 
 port_is_available() {
-    ! ss -lnt 2>/dev/null | awk -v port="${1}" '$4 ~ (":" port "$") { found = 1 } END { exit found }'
+    ss -lntH 2>/dev/null |
+        awk -v port="${1}" '$4 ~ (":" port "$") { found = 1 } END { exit(found ? 1 : 0) }'
 }
 
 select_port() {
@@ -558,7 +559,7 @@ select_port() {
 
     local candidate
     for _ in {1..100}; do
-        candidate="$((20000 + RANDOM % 40001))"
+        candidate="$((20000 + ((RANDOM << 1 | RANDOM & 1)) % 40001))"
         if port_is_available "${candidate}"; then
             PORT="${candidate}"
             log "随机监听端口：${PORT}"
@@ -1554,6 +1555,11 @@ uninstall_all() {
 main() {
 
     local command="${1:-install}"
+
+    if [[ "${command}" =~ ^PORT=([0-9]+)$ ]]; then
+        PORT="${BASH_REMATCH[1]}"
+        command="${2:-install}"
+    fi
 
     load_saved_settings
 
