@@ -36,12 +36,23 @@ USERS_FILE="${CONF_DIR}/users"
 INFO_FILE="${CONF_DIR}/node-info"
 SERVER_ENV="${CONF_DIR}/server.env"
 CLIENT_DIR="${CONF_DIR}/clients"
+SNELL_BIN="/usr/local/bin/snell-server"
+SNELL_CONF_DIR="/etc/snell"
+SNELL_CONF_FILE="${SNELL_CONF_DIR}/snell-server.conf"
+SNELL_SERVICE_FILE="/etc/systemd/system/snell.service"
 
 SERVICE_FILE="/etc/systemd/system/mihomo.service"
 
 PORT="${PORT:-}"
+TUIC_PORT="${TUIC_PORT:-}"
+SNELL_PORT="${SNELL_PORT:-}"
 SNI="${SNI:-www.apple.com}"
 DEST="${DEST:-${SNI}:443}"
+TUIC_UUID="${TUIC_UUID:-}"
+TUIC_PASSWORD="${TUIC_PASSWORD:-}"
+SNELL_PSK="${SNELL_PSK:-}"
+TUIC_CERT="${SNELL_CONF_DIR}/tuic-cert.pem"
+TUIC_KEY="${SNELL_CONF_DIR}/tuic-key.pem"
 
 load_saved_settings() {
     if [[ -z "${PORT}" && -r "${SERVER_ENV}" ]]; then
@@ -141,6 +152,7 @@ install_dependencies() {
         curl \
         wget \
         gzip \
+        unzip \
         openssl \
         uuid-runtime \
         iproute2 \
@@ -562,19 +574,47 @@ select_port() {
         candidate="$((20000 + ((RANDOM << 1 | RANDOM & 1)) % 40001))"
         if port_is_available "${candidate}"; then
             PORT="${candidate}"
-            log "随机监听端口：${PORT}"
+            log "随机 VLESS 监听端口：${PORT}"
             return
         fi
     done
 
-    die "无法找到可用的随机 TCP 端口。请使用 PORT=端口号 手动指定。"
+    die "无法找到可用的随机 TCP 端口。"
+}
+
+select_aux_port() {
+    local variable_name="$1"
+    local label="$2"
+    local current="${!variable_name}"
+    local candidate
+
+    if [[ -n "${current}" ]]; then
+        [[ "${current}" =~ ^[0-9]+$ ]] &&
+            (( current >= 1024 && current <= 65535 )) ||
+            die "${label}端口必须是 1024-65535 之间的整数。"
+        if ! port_is_available "${current}"; then
+            die "${label}端口 ${current} 已被占用。"
+        fi
+        return
+    fi
+
+    for _ in {1..100}; do
+        candidate="$((20000 + ((RANDOM << 1 | RANDOM & 1)) % 40001))"
+        if [[ "${candidate}" != "${PORT}" ]] && port_is_available "${candidate}"; then
+            printf -v "${variable_name}" '%s' "${candidate}"
+            log "随机 ${label}监听端口：${candidate}"
+            return
+        fi
+    done
+
+    die "无法为 ${label} 找到可用的随机端口。"
 }
 
 check_port() {
     log "检查 TCP ${PORT}..."
 
     if ! port_is_available "${PORT}"; then
-        die "TCP ${PORT} 已被其他程序占用。请使用 PORT=端口号 指定其他端口。"
+        die "TCP ${PORT} 已被其他程序占用。"
     fi
 }
 
@@ -594,8 +634,12 @@ configure_firewall() {
 
             ufw allow "${PORT}/tcp" >/dev/null || true
             ufw allow "${PORT}/udp" >/dev/null || true
+            ufw allow "${TUIC_PORT}/tcp" >/dev/null || true
+            ufw allow "${TUIC_PORT}/udp" >/dev/null || true
+            ufw allow "${SNELL_PORT}/tcp" >/dev/null || true
+            ufw allow "${SNELL_PORT}/udp" >/dev/null || true
 
-            log "UFW：已放行 TCP/UDP ${PORT}。"
+            log "UFW：已放行 VLESS ${PORT}、TUIC ${TUIC_PORT}、Snell ${SNELL_PORT}。"
         fi
     fi
 
@@ -607,19 +651,20 @@ configure_firewall() {
             firewall-cmd \
                 --permanent \
                 --add-port="${PORT}/tcp" >/dev/null || true
-
-            firewall-cmd \
-                --permanent \
-                --add-port="${PORT}/udp" >/dev/null || true
+            firewall-cmd --permanent --add-port="${PORT}/udp" >/dev/null || true
+            firewall-cmd --permanent --add-port="${TUIC_PORT}/tcp" >/dev/null || true
+            firewall-cmd --permanent --add-port="${TUIC_PORT}/udp" >/dev/null || true
+            firewall-cmd --permanent --add-port="${SNELL_PORT}/tcp" >/dev/null || true
+            firewall-cmd --permanent --add-port="${SNELL_PORT}/udp" >/dev/null || true
 
             firewall-cmd \
                 --reload >/dev/null || true
 
-            log "firewalld：已放行 TCP/UDP ${PORT}。"
+            log "firewalld：已放行 VLESS ${PORT}、TUIC ${TUIC_PORT}、Snell ${SNELL_PORT}。"
         fi
     fi
 
-    warn "如果 VPS 使用云厂商安全组，请另外放行 TCP ${PORT}。"
+    warn "如果 VPS 使用云厂商安全组，请放行 VLESS TCP ${PORT}、TUIC UDP ${TUIC_PORT}、Snell TCP/UDP ${SNELL_PORT}。"
 }
 
 # ============================================================
@@ -675,6 +720,97 @@ generate_short_id() {
     SHORT_ID="$(openssl rand -hex 8)"
 
     log "Reality Short ID：${SHORT_ID}"
+}
+
+# ============================================================
+# TUIC / Snell 凭据和服务
+# ============================================================
+
+generate_aux_credentials() {
+    [[ -n "${TUIC_UUID}" ]] || TUIC_UUID="$(generate_uuid)"
+    [[ -n "${TUIC_PASSWORD}" ]] || TUIC_PASSWORD="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)"
+    [[ -n "${SNELL_PSK}" ]] || SNELL_PSK="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32)"
+
+    mkdir -p "${SNELL_CONF_DIR}"
+
+    if [[ ! -s "${TUIC_CERT}" || ! -s "${TUIC_KEY}" ]]; then
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "${TUIC_KEY}" \
+            -out "${TUIC_CERT}" \
+            -days 3650 \
+            -subj "/CN=${SNI}" >/dev/null 2>&1 ||
+            die "TUIC 证书生成失败。"
+    fi
+
+    chmod 600 "${TUIC_KEY}"
+    chmod 644 "${TUIC_CERT}"
+}
+
+write_snell_config() {
+    mkdir -p "${SNELL_CONF_DIR}"
+
+    cat > "${SNELL_CONF_FILE}" <<EOF
+[snell-server]
+listen = 0.0.0.0:${SNELL_PORT}
+psk = ${SNELL_PSK}
+version = 5
+obfs = http
+obfs-host = ${SNI}
+EOF
+
+    chmod 600 "${SNELL_CONF_FILE}"
+}
+
+install_snell() {
+    [[ "${TARGET_ARCH}" == "amd64" ]] ||
+        die "Snell v5 自动安装目前仅支持 amd64。"
+
+    local snell_url="${SNELL_URL:-https://dl.nssurge.com/snell/snell-server-v5.0.0-linux-amd64.zip}"
+
+    log "下载 Snell v5..."
+    curl -fL --retry 3 --connect-timeout 15 --max-time 120 \
+        "${snell_url}" -o "${TMP_DIR}/snell.zip" ||
+        die "Snell v5 下载失败。"
+
+    unzip -p "${TMP_DIR}/snell.zip" snell-server > "${TMP_DIR}/snell-server" ||
+        die "Snell v5 压缩包格式无效。"
+
+    chmod 0755 "${TMP_DIR}/snell-server"
+    install -m 0755 "${TMP_DIR}/snell-server" "${SNELL_BIN}"
+    write_snell_config
+}
+
+create_snell_systemd() {
+    cat > "${SNELL_SERVICE_FILE}" <<EOF
+[Unit]
+Description=Snell v5 Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${SNELL_BIN} -c ${SNELL_CONF_FILE}
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable snell >/dev/null
+}
+
+start_snell() {
+    systemctl restart snell
+    sleep 2
+    if ! systemctl is-active --quiet snell; then
+        warn "Snell v5 启动失败。"
+        journalctl -u snell --no-pager -n 80 || true
+        die "Snell v5 服务未能启动。"
+    fi
+    log "Snell v5 正常运行。"
 }
 
 # ============================================================
@@ -750,6 +886,24 @@ EOF
 
       server-names:
         - ${SNI}
+EOF
+
+    cat >> "${CONF_FILE}" <<EOF
+
+  - name: tuic
+    type: tuic
+    listen: 0.0.0.0
+    port: ${TUIC_PORT}
+    users:
+      - uuid: ${TUIC_UUID}
+        password: ${TUIC_PASSWORD}
+    certificate: ${TUIC_CERT}
+    private-key: ${TUIC_KEY}
+    congestion-controller: bbr
+    max-idle-time: 15000
+    authentication-timeout: 1000
+    alpn:
+      - h3
 EOF
 
     chmod 600 "${CONF_FILE}"
@@ -956,6 +1110,32 @@ EOF
 
     echo "${uri}" > "${CLIENT_DIR}/v2rayn-vless.txt"
 
+    cat > "${CLIENT_DIR}/tuic.yaml" <<EOF
+proxies:
+  - name: mihomo-tuic
+    type: tuic
+    server: ${PUBLIC_IPV4}
+    port: ${TUIC_PORT}
+    uuid: ${TUIC_UUID}
+    password: ${TUIC_PASSWORD}
+    alpn:
+      - h3
+    disable-sni: false
+    reduce-rtt: true
+    udp-relay-mode: native
+    congestion-controller: bbr
+    skip-cert-verify: true
+    sni: ${SNI}
+EOF
+
+    cat > "${CLIENT_DIR}/tuic-uri.txt" <<EOF
+tuic://${TUIC_UUID}:${TUIC_PASSWORD}@${PUBLIC_IPV4}:${TUIC_PORT}?alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&sni=${SNI}#mihomo-tuic
+EOF
+
+    cat > "${CLIENT_DIR}/snell-surge.conf" <<EOF
+mihomo-snell = snell, ${PUBLIC_IPV4}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=5, obfs=http, obfs-host=${SNI}
+EOF
+
     # --------------------------------------------------------
     # IPv6 URI
     # --------------------------------------------------------
@@ -983,6 +1163,8 @@ save_info() {
 
     cat > "${SERVER_ENV}" <<EOF
 PORT=${PORT}
+TUIC_PORT=${TUIC_PORT}
+SNELL_PORT=${SNELL_PORT}
 SNI=${SNI}
 DEST=${DEST}
 PUBLIC_IPV4=${PUBLIC_IPV4}
@@ -990,6 +1172,9 @@ PUBLIC_IPV6=${PUBLIC_IPV6}
 PRIVATE_KEY=${PRIVATE_KEY}
 PUBLIC_KEY=${PUBLIC_KEY}
 SHORT_ID=${SHORT_ID}
+TUIC_UUID=${TUIC_UUID}
+TUIC_PASSWORD=${TUIC_PASSWORD}
+SNELL_PSK=${SNELL_PSK}
 EOF
 
     chmod 600 "${SERVER_ENV}"
@@ -1067,6 +1252,13 @@ ${CLIENT_DIR}/v2rayn-vless.txt
 VLESS URI:
 ${CLIENT_DIR}/vless-uri.txt
 
+TUIC:
+${CLIENT_DIR}/tuic.yaml
+${CLIENT_DIR}/tuic-uri.txt
+
+Snell v5 / Surge:
+${CLIENT_DIR}/snell-surge.conf
+
 ============================================================
 EOF
 
@@ -1114,7 +1306,10 @@ install_all() {
     detect_ipv6
 
     select_port
+    select_aux_port TUIC_PORT "TUIC"
+    select_aux_port SNELL_PORT "Snell"
     check_port
+    generate_aux_credentials
 
     generate_reality_keypair
     generate_short_id
@@ -1128,6 +1323,8 @@ install_all() {
     validate_config
 
     create_systemd
+    install_snell
+    create_snell_systemd
 
     configure_firewall
 
@@ -1135,6 +1332,7 @@ install_all() {
     generate_client_configs
 
     start_mihomo
+    start_snell
 
     echo
     echo "============================================================"
@@ -1271,14 +1469,15 @@ restart_service() {
     require_root
 
     systemctl restart mihomo
+    systemctl restart snell
 
     sleep 2
 
-    if systemctl is-active --quiet mihomo; then
-        echo "mihomo 重启成功。"
+    if systemctl is-active --quiet mihomo && systemctl is-active --quiet snell; then
+        echo "mihomo 与 Snell 重启成功。"
     else
-        echo "mihomo 重启失败。"
-        journalctl -u mihomo --no-pager -n 80
+        echo "mihomo 或 Snell 重启失败。"
+        journalctl -u mihomo -u snell --no-pager -n 80
         exit 1
     fi
 }
@@ -1529,13 +1728,15 @@ uninstall_all() {
         die "已取消。"
 
     systemctl disable --now mihomo 2>/dev/null || true
+    systemctl disable --now snell 2>/dev/null || true
 
-    rm -f "${SERVICE_FILE}"
-    rm -f "${BIN}"
+    rm -f "${SERVICE_FILE}" "${SNELL_SERVICE_FILE}"
+    rm -f "${BIN}" "${SNELL_BIN}"
 
     systemctl daemon-reload
 
     rm -rf "${CONF_DIR}"
+    rm -rf "${SNELL_CONF_DIR}"
 
     rm -f /etc/sysctl.d/99-mihomo-bbr.conf
     rm -f /etc/sysctl.d/99-mihomo-network.conf
