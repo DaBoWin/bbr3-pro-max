@@ -28,7 +28,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 APP_NAME="mihomo"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 BIN="/usr/local/bin/mihomo"
 CONF_DIR="/etc/mihomo"
@@ -52,8 +52,8 @@ DEST="${DEST:-${SNI}:443}"
 TUIC_UUID="${TUIC_UUID:-}"
 TUIC_PASSWORD="${TUIC_PASSWORD:-}"
 SNELL_PSK="${SNELL_PSK:-}"
-TUIC_CERT="${SNELL_CONF_DIR}/tuic-cert.pem"
-TUIC_KEY="${SNELL_CONF_DIR}/tuic-key.pem"
+TUIC_CERT="${CONF_DIR}/tuic-cert.pem"
+TUIC_KEY="${CONF_DIR}/tuic-key.pem"
 
 load_saved_settings() {
     if [[ -z "${PORT}" && -r "${SERVER_ENV}" ]]; then
@@ -745,18 +745,23 @@ generate_aux_credentials() {
 
     chmod 600 "${TUIC_KEY}"
     chmod 644 "${TUIC_CERT}"
+
+    # 证书位于 ${CONF_DIR}（mihomo SAFE_PATHS 允许的目录），
+    # 由 root 通过 openssl 生成；私钥为 600 权限，必须让 mihomo 服务用户可读。
+    chown mihomo:mihomo "${TUIC_KEY}" "${TUIC_CERT}" 2>/dev/null || true
 }
 
 write_snell_config() {
     mkdir -p "${SNELL_CONF_DIR}"
 
+    # snell-server v4/v5 只接受 listen / psk / ipv6 / dns / egress-interface。
+    # obfs、obfs-host 在 v4 之后已移除；version 由二进制本身决定，不是配置项。
+    # 写入这些无效键会让服务端与开启 obfs 的客户端握手失败（表现为"能连上端口但不通"）。
     cat > "${SNELL_CONF_FILE}" <<EOF
 [snell-server]
 listen = 0.0.0.0:${SNELL_PORT}
 psk = ${SNELL_PSK}
-version = 5
-obfs = http
-obfs-host = ${SNI}
+ipv6 = false
 EOF
 
     chmod 600 "${SNELL_CONF_FILE}"
@@ -766,7 +771,7 @@ install_snell() {
     [[ "${TARGET_ARCH}" == "amd64" ]] ||
         die "Snell v5 自动安装目前仅支持 amd64。"
 
-    local snell_url="${SNELL_URL:-https://dl.nssurge.com/snell/snell-server-v5.0.0-linux-amd64.zip}"
+    local snell_url="${SNELL_URL:-https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-amd64.zip}"
 
     log "下载 Snell v5..."
     curl -fL --retry 3 --connect-timeout 15 --max-time 120 \
@@ -1031,7 +1036,8 @@ make_tuic_uri() {
 
 make_snell_line() {
     local address="$1"
-    echo "mihomo-snell = snell, ${address}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=5, obfs=http, obfs-host=${SNI}"
+    # 不能带 obfs：snell-server v5 不支持混淆，客户端开启会导致握手失败。
+    echo "mihomo-snell = snell, ${address}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=5, reuse=true, tfo=true"
 }
 
 # ============================================================
@@ -1272,7 +1278,7 @@ PSK:
 ${SNELL_PSK}
 
 obfs:
-http (obfs-host=${SNI})
+不使用（snell-server v5 已移除混淆，客户端也必须关闭）
 
 Surge:
 
