@@ -14,7 +14,7 @@ set -Eeuo pipefail
 #   uninstall
 #
 # 默认：
-#   Port = 443
+#   Port = 随机高位端口（20000-60000）
 #   SNI  = www.apple.com
 #   DEST = www.apple.com:443
 #
@@ -39,9 +39,16 @@ CLIENT_DIR="${CONF_DIR}/clients"
 
 SERVICE_FILE="/etc/systemd/system/mihomo.service"
 
-PORT="${PORT:-443}"
+PORT="${PORT:-}"
 SNI="${SNI:-www.apple.com}"
 DEST="${DEST:-${SNI}:443}"
+
+load_saved_settings() {
+    if [[ -z "${PORT}" && -r "${SERVER_ENV}" ]]; then
+        # shellcheck disable=SC1090
+        source "${SERVER_ENV}"
+    fi
+}
 
 TMP_DIR="$(mktemp -d /tmp/mihomo-install.XXXXXX)"
 
@@ -534,37 +541,39 @@ EOF
 }
 
 # ============================================================
-# 检查 443
+# 选择并检查监听端口
 # ============================================================
 
-check_port() {
+port_is_available() {
+    ! ss -lnt 2>/dev/null | awk -v port="${1}" '$4 ~ (":" port "$") { found = 1 } END { exit found }'
+}
 
-    log "检查 TCP 443..."
+select_port() {
+    if [[ -n "${PORT}" ]]; then
+        [[ "${PORT}" =~ ^[0-9]+$ ]] &&
+            (( PORT >= 1024 && PORT <= 65535 )) ||
+            die "PORT 必须是 1024-65535 之间的整数。"
+        return
+    fi
 
-    local result
-
-    result="$(
-        ss -lntp 2>/dev/null |
-        awk '$4 ~ /:443$/ {print}' ||
-        true
-    )"
-
-    if [[ -n "${result}" ]]; then
-
-        if echo "${result}" | grep -q "mihomo"; then
-
-            log "443 已由 mihomo 使用。"
-
-        else
-
-            echo
-            warn "TCP 443 已被其他程序占用："
-            echo
-            echo "${result}"
-            echo
-
-            die "请先释放 TCP 443。"
+    local candidate
+    for _ in {1..100}; do
+        candidate="$((20000 + RANDOM % 40001))"
+        if port_is_available "${candidate}"; then
+            PORT="${candidate}"
+            log "随机监听端口：${PORT}"
+            return
         fi
+    done
+
+    die "无法找到可用的随机 TCP 端口。请使用 PORT=端口号 手动指定。"
+}
+
+check_port() {
+    log "检查 TCP ${PORT}..."
+
+    if ! port_is_available "${PORT}"; then
+        die "TCP ${PORT} 已被其他程序占用。请使用 PORT=端口号 指定其他端口。"
     fi
 }
 
@@ -582,10 +591,10 @@ configure_firewall() {
         if ufw status 2>/dev/null |
             grep -q "Status: active"; then
 
-            ufw allow 443/tcp >/dev/null || true
-            ufw allow 443/udp >/dev/null || true
+            ufw allow "${PORT}/tcp" >/dev/null || true
+            ufw allow "${PORT}/udp" >/dev/null || true
 
-            log "UFW：已放行 TCP/UDP 443。"
+            log "UFW：已放行 TCP/UDP ${PORT}。"
         fi
     fi
 
@@ -596,20 +605,20 @@ configure_firewall() {
 
             firewall-cmd \
                 --permanent \
-                --add-port=443/tcp >/dev/null || true
+                --add-port="${PORT}/tcp" >/dev/null || true
 
             firewall-cmd \
                 --permanent \
-                --add-port=443/udp >/dev/null || true
+                --add-port="${PORT}/udp" >/dev/null || true
 
             firewall-cmd \
                 --reload >/dev/null || true
 
-            log "firewalld：已放行 TCP/UDP 443。"
+            log "firewalld：已放行 TCP/UDP ${PORT}。"
         fi
     fi
 
-    warn "如果 VPS 使用云厂商安全组，请另外放行 TCP 443。"
+    warn "如果 VPS 使用云厂商安全组，请另外放行 TCP ${PORT}。"
 }
 
 # ============================================================
@@ -857,7 +866,7 @@ make_vless_uri() {
     local username="$2"
     local address="$3"
 
-    echo "vless://${uuid}@${address}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}"
+    echo "vless://${uuid}@${address}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}"
 }
 
 # ============================================================
@@ -896,7 +905,7 @@ proxies:
   - name: mihomo-vless-reality
     type: vless
     server: ${PUBLIC_IPV4}
-    port: 443
+    port: ${PORT}
     uuid: ${uuid}
     udp: true
     tls: true
@@ -919,7 +928,7 @@ EOF
       "type": "vless",
       "tag": "mihomo-vless-reality",
       "server": "${PUBLIC_IPV4}",
-      "server_port": 443,
+      "server_port": ${PORT},
       "uuid": "${uuid}",
       "flow": "xtls-rprx-vision",
       "tls": {
@@ -954,7 +963,7 @@ EOF
 
         local ipv6_uri
 
-        ipv6_uri="vless://${uuid}@\[${PUBLIC_IPV6}\]:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}-IPv6"
+        ipv6_uri="vless://${uuid}@\[${PUBLIC_IPV6}\]:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#mihomo-${username}-IPv6"
 
         echo "${ipv6_uri}" > "${CLIENT_DIR}/vless-ipv6-uri.txt"
 
@@ -1103,6 +1112,7 @@ install_all() {
     detect_ipv4
     detect_ipv6
 
+    select_port
     check_port
 
     generate_reality_keypair
@@ -1134,7 +1144,7 @@ install_all() {
     echo
     echo "服务器 IPv4：${PUBLIC_IPV4}"
     echo "服务器 IPv6：${PUBLIC_IPV6:-未检测到}"
-    echo "端口：443"
+    echo "端口：${PORT}"
     echo
     echo "SNI：${SNI}"
     echo "DEST：${DEST}"
@@ -1235,7 +1245,7 @@ show_status() {
     echo
 
     ss -lntp 2>/dev/null |
-        grep ':443' ||
+        grep ":${PORT}" ||
         true
 
     echo
@@ -1328,7 +1338,7 @@ proxies:
   - name: mihomo-${username}
     type: vless
     server: ${PUBLIC_IPV4}
-    port: 443
+    port: ${PORT}
     uuid: ${uuid}
     udp: true
     tls: true
@@ -1347,7 +1357,7 @@ EOF
       "type": "vless",
       "tag": "mihomo-${username}",
       "server": "${PUBLIC_IPV4}",
-      "server_port": 443,
+      "server_port": ${PORT},
       "uuid": "${uuid}",
       "flow": "xtls-rprx-vision",
       "tls": {
@@ -1544,6 +1554,8 @@ uninstall_all() {
 main() {
 
     local command="${1:-install}"
+
+    load_saved_settings
 
     case "${command}" in
 
