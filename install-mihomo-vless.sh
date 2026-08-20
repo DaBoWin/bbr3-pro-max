@@ -4,14 +4,19 @@ set -Eeuo pipefail
 # ============================================================
 # mihomo VLESS Reality 一键服务端
 #
-# 支持：
+# 不带参数运行 = 进入交互菜单。
+#
+# 也支持直接用子命令（便于脚本化调用）：
 #   install
 #   status
+#   info
+#   diagnose
 #   restart
 #   add-user <username>
 #   del-user <username>
 #   list-user
 #   uninstall
+#   menu
 #
 # 默认：
 #   Port = 随机高位端口（20000-60000）
@@ -28,7 +33,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 APP_NAME="mihomo"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 BIN="/usr/local/bin/mihomo"
 CONF_DIR="/etc/mihomo"
@@ -55,10 +60,35 @@ SNELL_PSK="${SNELL_PSK:-}"
 TUIC_CERT="${CONF_DIR}/tuic-cert.pem"
 TUIC_KEY="${CONF_DIR}/tuic-key.pem"
 
-load_saved_settings() {
-    if [[ -z "${PORT}" && -r "${SERVER_ENV}" ]]; then
+# 记录"用户显式用环境变量指定"的端口。
+# server.env 载入之后要把它们盖回来，保证环境变量优先级最高。
+ENV_PORT="${PORT}"
+ENV_TUIC_PORT="${TUIC_PORT}"
+ENV_SNELL_PORT="${SNELL_PORT}"
+
+# 可重复调用版本：菜单每次回到主界面都会刷新，
+# 否则安装/卸载之后界面上显示的还是旧端口。
+refresh_settings() {
+
+    if [[ -r "${SERVER_ENV}" ]]; then
         # shellcheck disable=SC1090
         source "${SERVER_ENV}"
+    else
+        PORT="${ENV_PORT}"
+        TUIC_PORT="${ENV_TUIC_PORT}"
+        SNELL_PORT="${ENV_SNELL_PORT}"
+    fi
+
+    if [[ -n "${ENV_PORT}" ]]; then
+        PORT="${ENV_PORT}"
+    fi
+
+    if [[ -n "${ENV_TUIC_PORT}" ]]; then
+        TUIC_PORT="${ENV_TUIC_PORT}"
+    fi
+
+    if [[ -n "${ENV_SNELL_PORT}" ]]; then
+        SNELL_PORT="${ENV_SNELL_PORT}"
     fi
 }
 
@@ -99,6 +129,104 @@ require_root() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# ============================================================
+# 交互输入
+# ============================================================
+
+# 用 `bash <(curl ...)` 运行时 stdin 还是终端，直接 read 没问题；
+# 但用 `curl ... | bash` 运行时 stdin 是脚本正文，read 会读到脚本内容。
+# 所以优先从 /dev/tty 读，两种方式都能正常交互。
+ask() {
+    local prompt="$1"
+    local varname="$2"
+    local value=""
+
+    if [[ -r /dev/tty ]]; then
+        read -r -p "${prompt}" value < /dev/tty || return 1
+    else
+        read -r -p "${prompt}" value || return 1
+    fi
+
+    printf -v "${varname}" '%s' "${value}"
+}
+
+interactive_available() {
+    [[ -r /dev/tty ]] || [[ -t 0 ]]
+}
+
+pause() {
+    local discard=""
+
+    echo
+    ask "按回车继续..." discard || true
+}
+
+confirm() {
+    local prompt="$1"
+    local answer=""
+
+    ask "${prompt} [y/N]： " answer || return 1
+
+    [[ "${answer}" == "y" || "${answer}" == "Y" ]]
+}
+
+# ============================================================
+# 安装状态 / 服务状态
+# ============================================================
+
+is_installed() {
+    # 不要用 `systemctl list-unit-files | grep -q`：
+    # grep -q 命中后立即退出，上游 systemctl 还在输出剩余 unit，
+    # 会被 SIGPIPE 杀掉（退出码 141）。脚本开了 set -o pipefail，
+    # 整条管道因此被判为失败，导致装好了也报"尚未安装"。
+    # 这里改成既不经过管道、也不依赖 systemctl 输出格式的判断。
+    [[ -f "${SERVICE_FILE}" ]] ||
+        systemctl cat mihomo.service >/dev/null 2>&1
+}
+
+# 输出：运行中 / 已停止 / 未安装
+unit_state() {
+    local unit="$1"
+
+    if ! systemctl cat "${unit}.service" >/dev/null 2>&1 &&
+        [[ ! -f "/etc/systemd/system/${unit}.service" ]]; then
+        echo "未安装"
+        return
+    fi
+
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+        echo "运行中"
+    else
+        echo "已停止"
+    fi
+}
+
+# 检查某端口是否处于监听状态，打印带标记的一行。
+# 注意 grep 无匹配会返回 1，这里必须 || true，否则 set -e 直接退出。
+check_listen() {
+    local proto="$1"
+    local port="$2"
+    local label="$3"
+    local found=""
+
+    if [[ -z "${port}" ]]; then
+        printf "  [ -- ] %-6s %s %-6s 未配置\n" "${label}" "${proto}" "-"
+        return
+    fi
+
+    if [[ "${proto}" == "udp" ]]; then
+        found="$(ss -lunpH 2>/dev/null | grep -E ":${port}[[:space:]]" || true)"
+    else
+        found="$(ss -lntpH 2>/dev/null | grep -E ":${port}[[:space:]]" || true)"
+    fi
+
+    if [[ -n "${found}" ]]; then
+        printf "  [ OK ] %-6s %s %-6s 正在监听\n" "${label}" "${proto}" "${port}"
+    else
+        printf "  [FAIL] %-6s %s %-6s 未监听\n" "${label}" "${proto}" "${port}"
+    fi
 }
 
 # ============================================================
@@ -1448,8 +1576,14 @@ install_all() {
     echo "管理命令"
     echo "------------------------------------------------------------"
     echo
+    echo "交互菜单（推荐，不带参数即可）："
+    echo "  $0"
+    echo
     echo "状态："
     echo "  $0 status"
+    echo
+    echo "诊断（TUIC/端口/证书/防火墙）："
+    echo "  $0 diagnose"
     echo
     echo "重启："
     echo "  $0 restart"
@@ -1486,8 +1620,7 @@ show_status() {
     echo "============================================================"
     echo
 
-    if systemctl list-unit-files 2>/dev/null |
-        grep -q "^mihomo.service"; then
+    if is_installed; then
 
         systemctl \
             --no-pager \
@@ -1505,16 +1638,9 @@ show_status() {
     echo "============================================================"
     echo
 
-    echo "VLESS  (TCP ${PORT}):"
-    ss -lntpH 2>/dev/null | grep -E ":${PORT}[[:space:]]" || echo "  [!] 未监听"
-    echo
-
-    echo "TUIC   (UDP ${TUIC_PORT}):"
-    ss -lunpH 2>/dev/null | grep -E ":${TUIC_PORT}[[:space:]]" || echo "  [!] 未监听"
-    echo
-
-    echo "Snell  (TCP ${SNELL_PORT}):"
-    ss -lntpH 2>/dev/null | grep -E ":${SNELL_PORT}[[:space:]]" || echo "  [!] 未监听"
+    check_listen tcp "${PORT}" "VLESS"
+    check_listen udp "${TUIC_PORT}" "TUIC"
+    check_listen tcp "${SNELL_PORT}" "Snell"
 
     echo
 
@@ -1527,6 +1653,200 @@ show_status() {
 
         cat "${INFO_FILE}"
     fi
+}
+
+# ============================================================
+# 查看节点信息
+# ============================================================
+
+show_nodes() {
+
+    require_root
+
+    [[ -f "${INFO_FILE}" ]] ||
+        die "找不到 ${INFO_FILE}，请先安装节点。"
+
+    cat "${INFO_FILE}"
+}
+
+# ============================================================
+# 诊断
+# ============================================================
+
+diagnose() {
+
+    require_root
+
+    echo
+    echo "============================================================"
+    echo "连通性诊断"
+    echo "============================================================"
+    echo
+
+    echo "服务状态："
+    printf "  mihomo : %s\n" "$(unit_state mihomo)"
+    printf "  snell  : %s\n" "$(unit_state snell)"
+    echo
+
+    echo "本机监听："
+    check_listen tcp "${PORT}" "VLESS"
+    check_listen udp "${TUIC_PORT}" "TUIC"
+    check_listen tcp "${SNELL_PORT}" "Snell"
+    echo
+
+    # --------------------------------------------------------
+    # TUIC 证书。
+    # 之前 TUIC 起不来就是这里：证书生成在 /etc/snell 且属主是 root，
+    # 而 mihomo 以 mihomo 用户运行，读不到私钥，listener 静默失败。
+    # --------------------------------------------------------
+
+    echo "TUIC 证书："
+
+    local cert_path="${TUIC_CERT}"
+    local key_path="${TUIC_KEY}"
+    local from_conf=""
+
+    if [[ -r "${CONF_FILE}" ]]; then
+
+        # certificate: 只出现在 tuic listener。
+        # private-key: 在 reality-config 里也有（值是 base64 密钥而不是路径），
+        # 所以只取"值以 / 开头"的那一行。
+        from_conf="$(
+            awk '/^[[:space:]]*certificate:[[:space:]]*\// { print $2; exit }' \
+                "${CONF_FILE}"
+        )"
+
+        if [[ -n "${from_conf}" ]]; then
+            cert_path="${from_conf}"
+        fi
+
+        from_conf="$(
+            awk '/^[[:space:]]*private-key:[[:space:]]*\// { print $2; exit }' \
+                "${CONF_FILE}"
+        )"
+
+        if [[ -n "${from_conf}" ]]; then
+            key_path="${from_conf}"
+        fi
+    fi
+
+    if [[ -s "${cert_path}" ]]; then
+        echo "  [ OK ] 证书 ${cert_path}"
+    else
+        echo "  [FAIL] 证书不存在：${cert_path}"
+    fi
+
+    if [[ -s "${key_path}" ]]; then
+        printf "  [ OK ] 私钥 %s  (%s)\n" \
+            "${key_path}" \
+            "$(stat -c '%U:%G %a' "${key_path}" 2>/dev/null || echo '权限未知')"
+    else
+        echo "  [FAIL] 私钥不存在：${key_path}"
+    fi
+
+    # mihomo 只允许读取工作目录内的文件（SAFE_PATHS）。
+    if [[ "${key_path}" != "${CONF_DIR}/"* ]]; then
+        echo "  [FAIL] 私钥不在 ${CONF_DIR} 内，mihomo 会拒绝加载该文件"
+        echo "         修复：把证书移入 ${CONF_DIR} 并同步改 ${CONF_FILE}"
+    fi
+
+    # 最关键的一项：服务用户到底能不能读私钥。
+    if command_exists runuser && id mihomo >/dev/null 2>&1; then
+
+        if runuser -u mihomo -- test -r "${key_path}" 2>/dev/null; then
+            echo "  [ OK ] mihomo 用户可读私钥"
+        else
+            echo "  [FAIL] mihomo 用户读不到私钥 → TUIC listener 会静默失败"
+            echo "         修复：chown mihomo:mihomo ${key_path}"
+        fi
+    fi
+
+    echo
+    echo "配置校验："
+
+    if [[ -x "${BIN}" && -r "${CONF_FILE}" ]]; then
+
+        if "${BIN}" -d "${CONF_DIR}" -f "${CONF_FILE}" -t >/dev/null 2>&1; then
+            echo "  [ OK ] mihomo -t 通过"
+        else
+            echo "  [FAIL] mihomo -t 失败："
+            "${BIN}" -d "${CONF_DIR}" -f "${CONF_FILE}" -t 2>&1 |
+                sed 's/^/         /' || true
+        fi
+    else
+        echo "  [ -- ] 尚未安装，跳过"
+    fi
+
+    echo
+    echo "防火墙："
+
+    local ufw_out=""
+
+    if command_exists ufw; then
+        ufw_out="$(ufw status 2>/dev/null || true)"
+    fi
+
+    if [[ "${ufw_out}" == *"Status: active"* ]]; then
+
+        if [[ -n "${TUIC_PORT}" && "${ufw_out}" == *"${TUIC_PORT}/udp"* ]]; then
+            echo "  [ OK ] ufw 已放行 ${TUIC_PORT}/udp"
+        else
+            echo "  [FAIL] ufw 已启用但没放行 ${TUIC_PORT}/udp"
+            echo "         修复：ufw allow ${TUIC_PORT}/udp"
+        fi
+    else
+        echo "  [ -- ] ufw 未启用"
+    fi
+
+    local nft_out=""
+
+    if command_exists nft; then
+
+        nft_out="$(nft list ruleset 2>/dev/null || true)"
+
+        if [[ -z "${nft_out}" ]]; then
+            echo "  [ OK ] nftables 无规则"
+        elif [[ "${nft_out}" == *"drop"* || "${nft_out}" == *"reject"* ]]; then
+            echo "  [ !! ] nftables 存在 drop/reject 规则，需确认是否拦了 UDP ${TUIC_PORT}"
+            echo "         查看：nft list ruleset"
+        else
+            echo "  [ OK ] nftables 无 drop/reject 规则"
+        fi
+    fi
+
+    echo
+    echo "最近的 mihomo 异常日志："
+
+    local logs=""
+
+    logs="$(
+        journalctl -u mihomo --no-pager -n 200 2>/dev/null |
+            grep -iE "error|warn|fail|tuic" |
+            tail -n 15 || true
+    )"
+
+    if [[ -n "${logs}" ]]; then
+        echo "${logs}" | sed 's/^/  /'
+    else
+        echo "  （无）"
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "如果上面本机监听全是 [ OK ] 但客户端还是连不上，"
+    echo "问题就在服务器之外，按顺序排查："
+    echo
+    echo "  1. 云厂商安全组单独放行 UDP ${TUIC_PORT:-<TUIC端口>}"
+    echo "     （VLESS 走 TCP，VLESS 通不代表 UDP 通）"
+    echo
+    echo "  2. 抓包确认客户端的包有没有到达服务器："
+    echo "       tcpdump -ni any udp port ${TUIC_PORT:-<TUIC端口>}"
+    echo "     没有任何包 = 被拦在服务器之外"
+    echo
+    echo "  3. TUIC 用的是自签证书，客户端必须开启跳过证书校验"
+    echo "     （Clash 系 skip-cert-verify、sing-box insecure）"
+    echo "------------------------------------------------------------"
+    echo
 }
 
 # ============================================================
@@ -1791,7 +2111,12 @@ uninstall_all() {
     echo "并删除本脚本创建的 BBR / 网络 sysctl 文件。"
     echo
 
-    read -r -p "确认卸载？输入 YES： " answer
+    local answer=""
+
+    # 走 ask() 而不是裸 read：通过 `curl ... | bash` 运行时
+    # stdin 是脚本正文，裸 read 会读到脚本内容而不是用户输入。
+    ask "确认卸载？输入 YES： " answer ||
+        die "无法读取输入，已取消。"
 
     [[ "${answer}" == "YES" ]] ||
         die "已取消。"
@@ -1819,21 +2144,258 @@ uninstall_all() {
 }
 
 # ============================================================
+# 交互菜单
+# ============================================================
+
+# 菜单里的动作统一放进子 shell 执行。
+# 原因：脚本里到处是 die()（内部就是 exit 1），
+# 在主 shell 直接调用会把整个菜单一起带走。
+# 子 shell 不会继承 EXIT trap，所以 TMP_DIR 也不会被提前清理。
+run_action() {
+    local rc=0
+
+    ( "$@" ) || rc=$?
+
+    if [[ "${rc}" -ne 0 ]]; then
+        echo
+        warn "操作未成功完成（退出码 ${rc}）。"
+    fi
+
+    return 0
+}
+
+menu_header() {
+
+    local mihomo_state
+    local snell_state
+
+    mihomo_state="$(unit_state mihomo)"
+    snell_state="$(unit_state snell)"
+
+    echo
+    echo "============================================================"
+    echo "        mihomo 多协议节点管理器      版本 ${SCRIPT_VERSION}"
+    echo "============================================================"
+    echo
+    printf "  服务    mihomo %s    snell %s\n" \
+        "${mihomo_state}" \
+        "${snell_state}"
+
+    if is_installed; then
+        printf "  节点    VLESS tcp/%s   TUIC udp/%s   Snell tcp/%s\n" \
+            "${PORT:-未知}" \
+            "${TUIC_PORT:-未知}" \
+            "${SNELL_PORT:-未知}"
+        printf "  地址    %s\n" "${PUBLIC_IPV4:-未知}"
+    else
+        echo "  节点    尚未安装"
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "  1) 安装 / 重装节点"
+    echo "  2) 查看节点信息（订阅链接）"
+    echo "  3) 服务状态与监听端口"
+    echo "  4) 连通性诊断"
+    echo "  5) 重启服务"
+    echo "  6) 用户管理"
+    echo "  7) 卸载"
+    echo "  0) 退出"
+    echo "------------------------------------------------------------"
+    echo
+}
+
+user_menu() {
+
+    local choice=""
+    local username=""
+
+    while true; do
+
+        echo
+        echo "------------------------------------------------------------"
+        echo "  用户管理"
+        echo "------------------------------------------------------------"
+        echo "  1) 用户列表"
+        echo "  2) 添加用户"
+        echo "  3) 删除用户"
+        echo "  0) 返回主菜单"
+        echo "------------------------------------------------------------"
+        echo
+
+        ask "请选择 [0-3]： " choice || return 0
+
+        case "${choice}" in
+
+            1)
+                run_action list_users
+                pause
+                ;;
+
+            2)
+                if ask "新用户名（字母/数字/.、_、-）： " username; then
+                    run_action add_user "${username}"
+                fi
+                pause
+                ;;
+
+            3)
+                run_action list_users
+
+                if ask "要删除的用户名： " username; then
+                    run_action delete_user "${username}"
+                fi
+                pause
+                ;;
+
+            0)
+                return 0
+                ;;
+
+            *)
+                warn "无效选择：${choice}"
+                ;;
+        esac
+    done
+}
+
+main_menu() {
+
+    require_root
+
+    local choice=""
+
+    while true; do
+
+        # 安装/卸载会改写 server.env，
+        # 动作跑在子 shell 里不会影响主 shell 的变量，
+        # 所以每轮都重新载入一次，界面才不会显示旧端口。
+        refresh_settings
+
+        menu_header
+
+        ask "请选择 [0-7]： " choice || return 0
+
+        case "${choice}" in
+
+            1)
+                if is_installed; then
+                    echo
+                    warn "检测到已安装。重装会重新生成 Reality 密钥对和 short-id，"
+                    warn "现有 VLESS 客户端配置将全部失效，需要重新导入。"
+                    echo
+
+                    if ! confirm "确认继续重装？"; then
+                        echo "已取消。"
+                        pause
+                        continue
+                    fi
+                fi
+
+                run_action install_all
+                pause
+                ;;
+
+            2)
+                run_action show_nodes
+                pause
+                ;;
+
+            3)
+                run_action show_status
+                pause
+                ;;
+
+            4)
+                run_action diagnose
+                pause
+                ;;
+
+            5)
+                run_action restart_service
+                pause
+                ;;
+
+            6)
+                user_menu
+                ;;
+
+            7)
+                run_action uninstall_all
+                pause
+                ;;
+
+            0)
+                echo
+                echo "退出。"
+                return 0
+                ;;
+
+            *)
+                warn "无效选择：${choice}"
+                pause
+                ;;
+        esac
+    done
+}
+
+# ============================================================
+# 用法
+# ============================================================
+
+usage() {
+    echo
+    echo "用法：不带参数运行进入交互菜单，或使用子命令："
+    echo
+    echo "  $0                     # 交互菜单"
+    echo "  $0 menu"
+    echo "  $0 install"
+    echo "  $0 status"
+    echo "  $0 info                # 只打印节点信息"
+    echo "  $0 diagnose            # 连通性诊断"
+    echo "  $0 restart"
+    echo "  $0 add-user <username>"
+    echo "  $0 del-user <username>"
+    echo "  $0 list-user"
+    echo "  $0 uninstall"
+    echo
+}
+
+# ============================================================
 # Main
 # ============================================================
 
 main() {
 
-    local command="${1:-install}"
+    local command="${1:-}"
 
     if [[ "${command}" =~ ^PORT=([0-9]+)$ ]]; then
         PORT="${BASH_REMATCH[1]}"
-        command="${2:-install}"
+        ENV_PORT="${PORT}"
+        shift
+        command="${1:-}"
     fi
 
-    load_saved_settings
+    refresh_settings
+
+    # 无参数：能交互就进菜单。
+    # 不能交互（例如 CI、cron、`curl | bash` 且没有 /dev/tty）时，
+    # 保持旧行为直接安装，避免自动化调用卡在菜单上。
+    if [[ -z "${command}" ]]; then
+
+        if interactive_available; then
+            main_menu
+            return
+        fi
+
+        command="install"
+    fi
 
     case "${command}" in
+
+        menu)
+            main_menu
+            ;;
 
         install)
             install_all
@@ -1841,6 +2403,14 @@ main() {
 
         status)
             show_status
+            ;;
+
+        info|node|nodes)
+            show_nodes
+            ;;
+
+        diagnose|doctor|check)
+            diagnose
             ;;
 
         restart)
@@ -1863,18 +2433,12 @@ main() {
             uninstall_all
             ;;
 
+        -h|--help|help)
+            usage
+            ;;
+
         *)
-            echo
-            echo "用法："
-            echo
-            echo "  $0 install"
-            echo "  $0 status"
-            echo "  $0 restart"
-            echo "  $0 add-user <username>"
-            echo "  $0 del-user <username>"
-            echo "  $0 list-user"
-            echo "  $0 uninstall"
-            echo
+            usage
             exit 1
             ;;
     esac
